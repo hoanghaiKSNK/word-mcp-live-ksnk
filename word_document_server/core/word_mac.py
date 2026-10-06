@@ -95,6 +95,21 @@ def _escape_js(s: str) -> str:
     )
 
 
+def _normalize_breaks(s: str) -> str:
+    """Turn literal backslash sequences (\\r\\n, \\r, \\n — as they arrive via
+    double-escaped JSON) into real carriage returns, Word's paragraph mark.
+    Real CR/LF/CRLF are left alone: Word for Mac already treats each of them
+    as a paragraph break when written via content."""
+    return s.replace("\\r\\n", "\r").replace("\\r", "\r").replace("\\n", "\r")
+
+
+def _escape_js_text(s: str) -> str:
+    """Escape document text for a JS string literal, normalising paragraph
+    breaks first (see _normalize_breaks). Use for any text written into the
+    document body (insert_text, table cells) so "\\n" never lands literally."""
+    return _escape_js(_normalize_breaks(s))
+
+
 def _doc_finder_js(filename: str = None) -> str:
     """Return JXA code snippet that sets `d` to the target document.
 
@@ -471,9 +486,7 @@ def mac_insert_text(
 ) -> str:
     """Insert text into document."""
     finder = _doc_finder_js(filename)
-    escaped = _escape_js(text)
-    # Handle literal \r\n → actual newlines for Word
-    escaped = escaped.replace("\\\\r\\\\n", "\\r").replace("\\\\r", "\\r").replace("\\\\n", "\\r")
+    escaped = _escape_js_text(text)
 
     bookmark_js = ""
     if bookmark:
@@ -641,8 +654,19 @@ var r = d.createRange({{start: startP, end: endP}});
         fmt_lines.append(f"r.fontObject.fontSize = {font_size};")
     if font_color:
         fmt_lines.append(f'r.fontObject.color = {_color_to_mac_rgb(font_color)};')
-    if highlight_color:
-        fmt_lines.append(f'r.highlightColorIndex = "{_escape_js(highlight_color)}";')
+    if highlight_color is not None:
+        # Mac WdColorIndex enum strings; invalid values silently CLEAR the highlight, so validate here
+        _hl_names = ["no highlight", "black", "blue", "turquoise", "bright green", "pink", "red",
+                     "yellow", "white", "dark blue", "teal", "green", "violet", "dark red",
+                     "dark yellow", "gray50", "gray25"]
+        _hl = str(highlight_color).strip().lower()
+        if _hl.isdigit() and int(_hl) < len(_hl_names):
+            _hl = _hl_names[int(_hl)]
+        elif _hl in ("none", "no", "auto"):
+            _hl = "no highlight"
+        if _hl not in _hl_names:
+            return json.dumps({"error": f"Invalid highlight_color: {highlight_color!r} (use 0-16)"})
+        fmt_lines.append(f'r.highlightColorIndex = "{_hl}";')
     if style_name:
         fmt_lines.append(f'r.style = d.wordStyles["{_escape_js(style_name.lower())}"];')
     if paragraph_alignment:
@@ -956,6 +980,54 @@ JSON.stringify({{added: true}});
 """)
 
 
+def mac_add_page_numbers(
+    filename: str = None,
+    section_index: int = 1,
+    position: str = "footer",
+    alignment: str = "center",
+    prefix: str = "",
+    suffix: str = "",
+    include_total: bool = False,
+) -> str:
+    """Add PAGE (and optionally NUMPAGES) fields to the primary header/footer.
+
+    Mac gotcha: `create new field` REPLACES the text range it is given, so the
+    header/footer text is written first with private-use placeholder
+    characters (U+E000 / U+E001), then each placeholder's one-character range
+    is turned into a field — rightmost first so earlier indices stay valid.
+    """
+    finder = _doc_finder_js(filename)
+    getter = "getHeader" if (position or "").lower() == "header" else "getFooter"
+    align_map = {"left": "align paragraph left", "center": "align paragraph center", "right": "align paragraph right"}
+    align_val = align_map.get((alignment or "").lower(), "align paragraph center")
+    prefix = prefix or ""
+    suffix = suffix or ""
+    mid = " / " if include_total else ""
+    ph_page = "\\uE000"
+    ph_total = "\\uE001" if include_total else ""
+    text_js = '"' + _escape_js(prefix) + ph_page + _escape_js(mid) + ph_total + _escape_js(suffix) + '"'
+    idx_page = len(prefix)
+    idx_total = len(prefix) + 1 + len(mid)
+    total_js = ""
+    if include_total:
+        total_js = f'app.createNewField({{textRange: hf.textObject.characters[{idx_total}], fieldType: "field num pages"}});'
+
+    return _run_jxa(f"""
+var app = Application("Microsoft Word");
+{finder}
+var secIdx = Math.max(0, {section_index} - 1);  // 1-based → 0-based
+if (secIdx >= d.sections.length) throw new Error("Section {section_index} out of range (1-" + d.sections.length + ")");
+var hf = app.{getter}(d.sections[secIdx], {{index: "header footer primary"}});
+hf.textObject.content = {text_js};
+{total_js}
+app.createNewField({{textRange: hf.textObject.characters[{idx_page}], fieldType: "field page"}});
+hf.textObject.paragraphFormat.alignment = "{align_val}";
+JSON.stringify({{success: true, document: d.name(), section: secIdx + 1, position: {json.dumps(position)},
+    alignment: {json.dumps(alignment)}, include_total: {"true" if include_total else "false"},
+    fields: hf.textObject.fields.length, text: hf.textObject.content().replace(/\\r$/, "")}});
+""")
+
+
 def mac_add_section_break(filename: str = None, break_type: str = "section break next page") -> str:
     """Insert a section break."""
     finder = _doc_finder_js(filename)
@@ -1035,24 +1107,44 @@ def mac_add_table(
     cols: int = 3,
     position: str = "end",
     data: list = None,
+    style: str = "Table Grid",
+    autofit: str = "window",
     track_changes: bool = False,
 ) -> str:
-    """Add a table to the document."""
+    """Add a table to the document.
+
+    Mac gotchas: the range handed to make() must come from d.createRange()
+    (app.createRange(d, ...) raises -1708) and be passed as textObject in
+    withProperties (otherwise Word ignores the row/column counts). The object
+    make() returns is not usable with getCellFromTable, so the new table is
+    re-fetched from d.tables by position before styling/filling it.
+    """
     finder = _doc_finder_js(filename)
-    pos_js = "var pos = d.textObject.endOfContent() - 1;" if position == "end" else f"var pos = {position};"
     if position == "start":
         pos_js = "var pos = 0;"
+    elif position == "end":
+        pos_js = "var pos = d.textObject.endOfContent() - 1;"
+    else:
+        try:
+            pos_js = f"var pos = {int(position)};"
+        except (TypeError, ValueError):
+            return json.dumps({"error": f"Invalid position: {position}"})
+
+    autofit_map = {"window": "auto fit window", "content": "auto fit content", "fixed": "auto fit fixed"}
+    autofit_js = ""
+    if autofit and autofit.lower() in autofit_map:
+        autofit_js = f'app.autoFitBehavior(t, {{behavior: "{autofit_map[autofit.lower()]}"}});'
+    # Mac: assigning the style NAME is silently ignored; assign the wordStyles object (readback is always null — verify via XML)
+    style_js = f'try {{ t.style = d.wordStyles["{_escape_js(style)}"]; }} catch (e) {{}}' if style else ""
 
     data_js = ""
     if data:
-        data_json = json.dumps(data)
+        norm = [[_normalize_breaks(v) if isinstance(v, str) else v for v in r] for r in data]
         data_js = f"""
-    var data = {data_json};
+    var data = {json.dumps(norm)};
     for (var ri = 0; ri < Math.min(data.length, {rows}); ri++) {{
         for (var ci = 0; ci < Math.min(data[ri].length, {cols}); ci++) {{
-            var tRef = d.tables[d.tables.length - 1];
-        var cell = app.getCellFromTable(tRef, {{row: ri + 1, column: ci + 1}});
-            cell.textObject.content = String(data[ri][ci]);
+            app.getCellFromTable(t, {{row: ri + 1, column: ci + 1}}).textObject.content = String(data[ri][ci]);
         }}
     }}
 """
@@ -1061,14 +1153,29 @@ def mac_add_table(
 var app = Application("Microsoft Word");
 {finder}
 {pos_js}
-var rng = app.createRange(d, {{start: pos, end: pos}});
-var t = app.make({{new: "table", at: d, withProperties: {{
-    textObject: rng,
-    numberOfRows: {rows},
-    numberOfColumns: {cols}
-}}}});
-{data_js}
-JSON.stringify({{added: true, rows: {rows}, cols: {cols}, tables: d.tables.length}});
+var prevTracking = d.trackRevisions();
+if ({"true" if track_changes else "false"}) d.trackRevisions = true;
+var t = null;
+try {{
+    var rng = d.createRange({{start: pos, end: pos}});
+    app.make({{new: "table", at: d, withProperties: {{
+        textObject: rng,
+        numberOfRows: {rows},
+        numberOfColumns: {cols}
+    }}}});
+    for (var ti = 0; ti < d.tables.length; ti++) {{  // re-fetch: first table at/after pos
+        if (d.tables[ti].textObject.startOfContent() >= pos) {{ t = d.tables[ti]; break; }}
+    }}
+    if (!t) t = d.tables[d.tables.length - 1];
+    {style_js}
+    {autofit_js}
+    {data_js}
+}} finally {{
+    d.trackRevisions = prevTracking;
+}}
+JSON.stringify({{success: true, added: true, document: d.name(), rows: t.rows.length, cols: t.columns.length,
+    tables: d.tables.length, position: {json.dumps(str(position))},
+    style: {json.dumps(style or None)}, autofit: {json.dumps(autofit or None)}, tracked: {"true" if track_changes else "false"}}});
 """)
 
 
@@ -1079,68 +1186,161 @@ def mac_modify_table(
     row: int = None,
     col: int = None,
     text: str = None,
+    before_row: int = None,
+    cells: list = None,
     track_changes: bool = False,
 ) -> str:
-    """Modify table structure or content."""
-    finder = _doc_finder_js(filename)
+    """Modify table structure or content (get_info, set_cell, set_row, add_row, delete_row).
 
-    if operation == "get_info":
+    Mac gotchas: getCellFromTable does NOT bounds-check (row 10 of a 9-row
+    table silently returns some other cell), so every operation validates
+    indices first. Word for Mac has no make-new-row verb: add_row positions
+    the app-level selection (selectionStart/End) inside the anchor row and
+    calls `insert rows` on it, which only works when the target document is
+    the active one (activateObject; the previous document is re-activated
+    afterwards).
+    """
+    finder = _doc_finder_js(filename)
+    op = (operation or "").lower()
+    track_js = "true" if track_changes else "false"
+    table_js = f"""
+var tCount = d.tables.length;
+if (tCount === 0) throw new Error("Document has no tables");
+var tIdx = Math.max(0, {table_index} - 1);  // 1-based → 0-based
+if (tIdx >= tCount) throw new Error("table_index {table_index} out of range (1-" + tCount + ")");
+var t = d.tables[tIdx];
+var nRows = t.rows.length;
+var nCols = t.columns.length;
+"""
+
+    if op == "get_info":
         return _run_jxa(f"""
 var app = Application("Microsoft Word");
 {finder}
-var t = d.tables[Math.max(0, {table_index} - 1)];  // 1-based → 0-based
-var rows = t.rows.length;
-var cols = t.columns.length;
+{table_js}
 var cells = [];
-for (var r = 1; r <= rows; r++) {{
-    for (var c = 1; c <= cols; c++) {{
+for (var r = 1; r <= nRows; r++) {{
+    for (var c = 1; c <= nCols; c++) {{
         var cell = app.getCellFromTable(t, {{row: r, column: c}});
         cells.push({{row: r, col: c, text: cell.textObject.content().replace(/[\\r\\x07]/g, "")}});
     }}
 }}
-JSON.stringify({{rows: rows, cols: cols, cells: cells}});
+JSON.stringify({{rows: nRows, cols: nCols, cells: cells, document: d.name(), table_index: tIdx + 1}});
 """)
 
-    elif operation == "set_cell":
-        escaped_text = _escape_js(text or "")
+    elif op == "set_cell":
+        if row is None or col is None or text is None:
+            return json.dumps({"error": "set_cell requires row, col, and text"})
         return _run_jxa(f"""
 var app = Application("Microsoft Word");
 {finder}
+{table_js}
+if ({row} < 1 || {row} > nRows) throw new Error("Row {row} out of range (1-" + nRows + ")");
+if ({col} < 1 || {col} > nCols) throw new Error("Col {col} out of range (1-" + nCols + ")");
 var prevTracking = d.trackRevisions();
-if ({"true" if track_changes else "false"}) d.trackRevisions = true;
+if ({track_js}) d.trackRevisions = true;
 try {{
-    var t = d.tables[Math.max(0, {table_index} - 1)];  // 1-based → 0-based
-    var cell = app.getCellFromTable(t, {{row: {row}, column: {col}}});
-    cell.textObject.content = "{escaped_text}";
+    app.getCellFromTable(t, {{row: {row}, column: {col}}}).textObject.content = "{_escape_js_text(text)}";
 }} finally {{
     d.trackRevisions = prevTracking;
 }}
-JSON.stringify({{set: true, row: {row}, col: {col}}});
+JSON.stringify({{success: true, operation: "set_cell", row: {row}, col: {col},
+    document: d.name(), table_index: tIdx + 1, tracked: {track_js}}});
 """)
 
-    elif operation == "insert_row":
+    elif op == "set_row":
+        if row is None or not cells:
+            return json.dumps({"error": "set_row requires row and cells (list of values)"})
+        vals = [_normalize_breaks(v) if isinstance(v, str) else v for v in cells]
         return _run_jxa(f"""
 var app = Application("Microsoft Word");
 {finder}
-var t = d.tables[Math.max(0, {table_index} - 1)];  // 1-based → 0-based
-var targetRow = {row or "t.rows.length"};
-var cell = app.getCellFromTable(t, {{row: targetRow, column: 1}});
-app.select(cell.textObject);
-app.insertRows(app.selection, {{numberOfRows: 1}});
-JSON.stringify({{inserted: true, rows: t.rows.length}});
+{table_js}
+if ({row} < 1 || {row} > nRows) throw new Error("Row {row} out of range (1-" + nRows + ")");
+var vals = {json.dumps(vals)};
+var updated = [];
+var prevTracking = d.trackRevisions();
+if ({track_js}) d.trackRevisions = true;
+try {{
+    for (var i = 0; i < vals.length && i < nCols; i++) {{
+        if (vals[i] === null) continue;
+        app.getCellFromTable(t, {{row: {row}, column: i + 1}}).textObject.content = String(vals[i]);
+        updated.push(i + 1);
+    }}
+}} finally {{
+    d.trackRevisions = prevTracking;
+}}
+JSON.stringify({{success: true, operation: "set_row", row: {row}, cells_updated: updated, total_cols: nCols,
+    document: d.name(), table_index: tIdx + 1, tracked: {track_js}}});
 """)
 
-    elif operation == "delete_row":
+    elif op in ("add_row", "insert_row"):
+        if op == "insert_row" and before_row is None:
+            before_row = row
+        vals = [_normalize_breaks(v) if isinstance(v, str) else v for v in (cells or [])]
         return _run_jxa(f"""
 var app = Application("Microsoft Word");
 {finder}
-var t = d.tables[Math.max(0, {table_index} - 1)];  // 1-based → 0-based
-var targetRow = {row or "t.rows.length"};
-app.delete(t.rows[targetRow - 1]);
-JSON.stringify({{deleted: true, rows: t.rows.length}});
+{table_js}
+var beforeRow = {json.dumps(before_row)};
+if (beforeRow !== null && (beforeRow < 1 || beforeRow > nRows + 1))
+    throw new Error("before_row " + beforeRow + " out of range (1-" + (nRows + 1) + ")");
+var append = (beforeRow === null || beforeRow > nRows);
+var anchorRow = append ? nRows : beforeRow;
+var newRow = append ? nRows + 1 : beforeRow;
+var anchor = app.getCellFromTable(t, {{row: anchorRow, column: 1}}).textObject.startOfContent();
+var prevName = app.activeDocument.name();
+var prevTracking = d.trackRevisions();
+if ({track_js}) d.trackRevisions = true;
+try {{
+    app.activateObject(d);
+    if (app.activeDocument.name() !== d.name())
+        throw new Error("Could not activate '" + d.name() + "' for row insertion");
+    var sel = app.selection;
+    sel.selectionStart = anchor;
+    sel.selectionEnd = anchor;
+    if (sel.selectionStart() !== anchor || sel.document.name() !== d.name())
+        throw new Error("Selection could not be positioned in the target table");
+    sel.insertRows({{position: append ? "below" : "above", numberOfRows: 1}});
+    if (t.rows.length !== nRows + 1)
+        throw new Error("Row insertion did not take effect (rows=" + t.rows.length + ")");
+    var vals = {json.dumps(vals)};
+    for (var i = 0; i < vals.length && i < nCols; i++) {{
+        if (vals[i] === null) continue;
+        app.getCellFromTable(t, {{row: newRow, column: i + 1}}).textObject.content = String(vals[i]);
+    }}
+}} finally {{
+    d.trackRevisions = prevTracking;
+    if (prevName !== d.name()) {{
+        for (var di = 0; di < app.documents.length; di++) {{
+            if (app.documents[di].name() === prevName) {{ try {{ app.activateObject(app.documents[di]); }} catch (e) {{}} break; }}
+        }}
+    }}
+}}
+JSON.stringify({{success: true, operation: "add_row", new_row: newRow, total_rows: t.rows.length,
+    document: d.name(), table_index: tIdx + 1, tracked: {track_js}}});
 """)
 
-    return json.dumps({"error": f"Unknown operation: {operation}"})
+    elif op == "delete_row":
+        if row is None:
+            return json.dumps({"error": "delete_row requires row"})
+        return _run_jxa(f"""
+var app = Application("Microsoft Word");
+{finder}
+{table_js}
+if ({row} < 1 || {row} > nRows) throw new Error("Row {row} out of range (1-" + nRows + ")");
+var prevTracking = d.trackRevisions();
+if ({track_js}) d.trackRevisions = true;
+try {{
+    app.delete(t.rows[{row} - 1]);
+}} finally {{
+    d.trackRevisions = prevTracking;
+}}
+JSON.stringify({{success: true, operation: "delete_row", deleted_row: {row}, remaining_rows: t.rows.length,
+    document: d.name(), table_index: tIdx + 1, tracked: {track_js}}});
+""")
+
+    return json.dumps({"error": f"Unknown operation '{op}'. On macOS use: get_info, set_cell, set_row, add_row, delete_row"})
 
 
 # ── Screen Capture ───────────────────────────────────────────────────────

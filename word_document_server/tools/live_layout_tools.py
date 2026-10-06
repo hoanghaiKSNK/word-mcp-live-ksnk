@@ -44,7 +44,16 @@ async def word_live_set_page_layout(
     """
     if _MAC_AVAILABLE:
         from word_document_server.core.word_mac import mac_set_page_layout
-        return mac_set_page_layout(filename=filename, section_index=section_index, orientation=orientation, page_width=page_width, page_height=page_height, top_margin=top_margin, bottom_margin=bottom_margin, left_margin=left_margin, right_margin=right_margin)
+        # Mac JXA page setup values are in points; the tool contract is inches.
+        def _pts(inches):
+            return None if inches is None else inches * _PTS_PER_INCH
+
+        return mac_set_page_layout(
+            filename=filename, section_index=section_index, orientation=orientation,
+            page_width=_pts(page_width_inches), page_height=_pts(page_height_inches),
+            top_margin=_pts(margin_top_inches), bottom_margin=_pts(margin_bottom_inches),
+            left_margin=_pts(margin_left_inches), right_margin=_pts(margin_right_inches),
+        )
 
     if sys.platform != "win32":
         return json.dumps({"error": "Live layout tools are only available on Windows"})
@@ -201,7 +210,8 @@ async def word_live_add_page_numbers(
         JSON with result info.
     """
     if _MAC_AVAILABLE:
-        return json.dumps({"error": "word_live_add_page_numbers is not yet implemented on macOS"})
+        from word_document_server.core.word_mac import mac_add_page_numbers
+        return mac_add_page_numbers(filename=filename, section_index=section_index, position=position, alignment=alignment, prefix=prefix, suffix=suffix, include_total=include_total)
 
     if sys.platform != "win32":
         return json.dumps({"error": "Live layout tools are only available on Windows"})

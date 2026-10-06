@@ -1203,7 +1203,7 @@ async def word_live_add_table(
     """
     if _MAC_AVAILABLE:
         from word_document_server.core.word_mac import mac_add_table
-        return mac_add_table(filename=filename, rows=rows, cols=cols, position=position, data=data, track_changes=track_changes)
+        return mac_add_table(filename=filename, rows=rows, cols=cols, position=position, data=data, style=style, autofit=autofit, track_changes=track_changes)
 
     if sys.platform != "win32":
         return json.dumps({"error": "Live editing is only available on Windows"})
@@ -1635,7 +1635,7 @@ async def word_live_modify_table(
     """
     if _MAC_AVAILABLE:
         from word_document_server.core.word_mac import mac_modify_table
-        return mac_modify_table(filename=filename, table_index=table_index, operation=operation, row=row, col=col, text=text, track_changes=track_changes)
+        return mac_modify_table(filename=filename, table_index=table_index, operation=operation, row=row, col=col, text=text, before_row=before_row, cells=cells, track_changes=track_changes)
 
     if sys.platform != "win32":
         return json.dumps({"error": "Live editing is only available on Windows"})
