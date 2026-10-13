@@ -100,10 +100,24 @@ mcp = FastMCP("Word Document Server")
 def register_tools():
     """Register all tools with the MCP server using FastMCP decorators."""
     from word_document_server.core.sta_dispatch import install_sta_dispatch
-    install_sta_dispatch(live_tools, live_read_tools, live_layout_tools)
+    from word_document_server.core.tool_dispatch import dispatch_tool, diagnostics
+    install_sta_dispatch(live_tools, live_read_tools, live_layout_tools, screen_capture_tools)
+
+    def register_tool(**options):
+        def register(function):
+            return mcp.tool(**options)(dispatch_tool(function))
+        return register
+
+    @mcp.tool(annotations=ToolAnnotations(title='Word MCP Dispatch Status', readOnlyHint=True))
+    async def word_mcp_dispatch_status():
+        """Read this server's version, PID, live queue and file pool without waiting for Word.
+        Includes recent request IDs/timings, never document text or paths.
+        A cancelled running edit may still finish. Old servers do not use the new lock.
+        """
+        return diagnostics()
     
     # Document tools (create, copy, info, etc.)
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Create Word Document",
             destructiveHint=True,
@@ -113,7 +127,7 @@ def register_tools():
         """Create a new Word document with optional metadata."""
         return document_tools.create_document(filename, title, author)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Copy Word Document",
             destructiveHint=True,
@@ -123,7 +137,7 @@ def register_tools():
         """Create a copy of a Word document."""
         return document_tools.copy_document(source_filename, destination_filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Document Info",
             readOnlyHint=True,
@@ -133,7 +147,7 @@ def register_tools():
         """Get information about a Word document."""
         return document_tools.get_document_info(filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Document Text",
             readOnlyHint=True,
@@ -148,7 +162,7 @@ def register_tools():
         {+inserted+}."""
         return document_tools.get_document_text(filename, show_revisions=show_revisions)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Document Outline",
             readOnlyHint=True,
@@ -158,7 +172,7 @@ def register_tools():
         """Get the structure of a Word document."""
         return document_tools.get_document_outline(filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="List Available Documents",
             readOnlyHint=True,
@@ -168,7 +182,7 @@ def register_tools():
         """List all .docx files in the specified directory."""
         return document_tools.list_available_documents(directory)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Document XML",
             readOnlyHint=True,
@@ -178,7 +192,7 @@ def register_tools():
         """Get the raw XML structure of a Word document."""
         return document_tools.get_document_xml_tool(filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Insert Header Near Text",
             readOnlyHint=False,
@@ -189,7 +203,7 @@ def register_tools():
         """Insert a header (with specified style) before or after the target paragraph. Specify by text or paragraph index. Args: filename (str), target_text (str, optional), header_title (str), position ('before' or 'after'), header_style (str, default 'Heading 1'), target_paragraph_index (int, optional)."""
         return content_tools.insert_header_near_text_tool(filename, target_text, header_title, position, header_style, target_paragraph_index)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Insert Line Near Text",
             readOnlyHint=False,
@@ -202,7 +216,7 @@ def register_tools():
         """
         return content_tools.insert_line_or_paragraph_near_text_tool(filename, target_text, line_text, position, line_style, target_paragraph_index)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Insert List Near Text",
             readOnlyHint=False,
@@ -213,7 +227,7 @@ def register_tools():
         """Insert a bulleted or numbered list before or after the target paragraph. Specify by text or paragraph index. Args: filename (str), target_text (str, optional), list_items (list of str), position ('before' or 'after'), target_paragraph_index (int, optional), bullet_type ('bullet' for bullets or 'number' for numbered lists, default: 'bullet')."""
         return content_tools.insert_numbered_list_near_text_tool(filename, target_text, list_items, position, target_paragraph_index, bullet_type)
     # Content tools (paragraphs, headings, tables, etc.)
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Paragraph",
             readOnlyHint=False,
@@ -237,7 +251,7 @@ def register_tools():
         """
         return content_tools.add_paragraph(filename, text, style, font_name, font_size, bold, italic, color)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Heading",
             readOnlyHint=False,
@@ -261,7 +275,7 @@ def register_tools():
         """
         return content_tools.add_heading(filename, text, level, font_name, font_size, bold, italic, border_bottom)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Picture",
             readOnlyHint=False,
@@ -272,7 +286,7 @@ def register_tools():
         """Add an image to a Word document."""
         return content_tools.add_picture(filename, image_path, width)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Table",
             readOnlyHint=False,
@@ -283,7 +297,7 @@ def register_tools():
         """Add a table to a Word document."""
         return content_tools.add_table(filename, rows, cols, data)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Page Break",
             readOnlyHint=False,
@@ -294,7 +308,7 @@ def register_tools():
         """Add a page break to the document."""
         return content_tools.add_page_break(filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Delete Paragraph",
             destructiveHint=True,
@@ -304,7 +318,7 @@ def register_tools():
         """Delete a paragraph from a document."""
         return content_tools.delete_paragraph(filename, paragraph_index)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Search and Replace",
             destructiveHint=True,
@@ -315,7 +329,7 @@ def register_tools():
         return content_tools.search_and_replace(filename, find_text, replace_text)
     
     # Format tools (styling, text formatting, etc.)
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Create Custom Style",
             readOnlyHint=False,
@@ -331,7 +345,7 @@ def register_tools():
             filename, style_name, bold, italic, font_size, font_name, color, base_style
         )
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Format Text",
             readOnlyHint=False,
@@ -347,7 +361,7 @@ def register_tools():
             underline, color, font_size, font_name
         )
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Format Table",
             readOnlyHint=False,
@@ -360,7 +374,7 @@ def register_tools():
         return format_tools.format_table(filename, table_index, has_header_row, border_style, shading)
     
     # New table cell shading tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Table Cell Shading",
             readOnlyHint=False,
@@ -372,7 +386,7 @@ def register_tools():
         """Apply shading/filling to a specific table cell."""
         return format_tools.set_table_cell_shading(filename, table_index, row_index, col_index, fill_color, pattern)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Apply Alternating Row Colors",
             readOnlyHint=False,
@@ -384,7 +398,7 @@ def register_tools():
         """Apply alternating row colors to a table for better readability."""
         return format_tools.apply_table_alternating_rows(filename, table_index, color1, color2)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Highlight Table Header",
             readOnlyHint=False,
@@ -397,7 +411,7 @@ def register_tools():
         return format_tools.highlight_table_header(filename, table_index, header_color, text_color)
     
     # Cell merging tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Merge Table Cells",
             readOnlyHint=False,
@@ -409,7 +423,7 @@ def register_tools():
         """Merge cells in a rectangular area of a table."""
         return format_tools.merge_table_cells(filename, table_index, start_row, start_col, end_row, end_col)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Merge Cells Horizontally",
             readOnlyHint=False,
@@ -421,7 +435,7 @@ def register_tools():
         """Merge cells horizontally in a single row."""
         return format_tools.merge_table_cells_horizontal(filename, table_index, row_index, start_col, end_col)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Merge Cells Vertically",
             readOnlyHint=False,
@@ -434,7 +448,7 @@ def register_tools():
         return format_tools.merge_table_cells_vertical(filename, table_index, col_index, start_row, end_row)
     
     # Cell alignment tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Cell Alignment",
             readOnlyHint=False,
@@ -446,7 +460,7 @@ def register_tools():
         """Set text alignment for a specific table cell."""
         return format_tools.set_table_cell_alignment(filename, table_index, row_index, col_index, horizontal, vertical)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Table Alignment",
             readOnlyHint=False,
@@ -459,7 +473,7 @@ def register_tools():
         return format_tools.set_table_alignment_all(filename, table_index, horizontal, vertical)
     
     # Protection tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Protect Document",
             readOnlyHint=False,
@@ -470,7 +484,7 @@ def register_tools():
         """Add password protection to a Word document."""
         return protection_tools.protect_document(filename, password)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Unprotect Document",
             readOnlyHint=False,
@@ -482,7 +496,7 @@ def register_tools():
         return protection_tools.unprotect_document(filename, password)
     
     # Footnote tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Footnote",
             readOnlyHint=False,
@@ -493,7 +507,7 @@ def register_tools():
         """Add a footnote to a specific paragraph in a Word document."""
         return footnote_tools.add_footnote_to_document(filename, paragraph_index, footnote_text)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Footnote After Text",
             readOnlyHint=False,
@@ -506,7 +520,7 @@ def register_tools():
         This enhanced function ensures footnotes display correctly as superscript."""
         return footnote_tools.add_footnote_after_text(filename, search_text, footnote_text, output_filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Footnote Before Text",
             readOnlyHint=False,
@@ -519,7 +533,7 @@ def register_tools():
         This enhanced function ensures footnotes display correctly as superscript."""
         return footnote_tools.add_footnote_before_text(filename, search_text, footnote_text, output_filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Footnote Enhanced",
             readOnlyHint=False,
@@ -532,7 +546,7 @@ def register_tools():
         Adds footnote at the end of a specific paragraph with proper style handling."""
         return footnote_tools.add_footnote_enhanced(filename, paragraph_index, footnote_text, output_filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Endnote",
             readOnlyHint=False,
@@ -543,7 +557,7 @@ def register_tools():
         """Add an endnote to a specific paragraph in a Word document."""
         return footnote_tools.add_endnote_to_document(filename, paragraph_index, endnote_text)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Customize Footnote Style",
             readOnlyHint=False,
@@ -558,7 +572,7 @@ def register_tools():
             filename, numbering_format, start_number, font_name, font_size
         )
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Delete Footnote",
             destructiveHint=True,
@@ -573,7 +587,7 @@ def register_tools():
         )
     
     # Robust footnote tools - Production-ready with comprehensive validation
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Footnote Robust",
             readOnlyHint=False,
@@ -590,7 +604,7 @@ def register_tools():
             validate_location, auto_repair
         )
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Validate Footnotes",
             readOnlyHint=True,
@@ -601,7 +615,7 @@ def register_tools():
         Returns detailed report on ID conflicts, orphaned content, missing styles, etc."""
         return footnote_tools.validate_footnotes_tool(filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Delete Footnote Robust",
             destructiveHint=True,
@@ -616,7 +630,7 @@ def register_tools():
         )
     
     # Extended document tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Paragraph Text",
             readOnlyHint=True,
@@ -626,7 +640,7 @@ def register_tools():
         """Get text from a specific paragraph in a Word document."""
         return extended_document_tools.get_paragraph_text_from_document(filename, paragraph_index)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Find Text",
             readOnlyHint=True,
@@ -639,7 +653,7 @@ def register_tools():
             filename, text_to_find, match_case, whole_word
         )
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Highlighted Text",
             readOnlyHint=True,
@@ -649,7 +663,7 @@ def register_tools():
         """Extract all highlighted/colored text from a Word document, including text inside tables."""
         return extended_document_tools.get_highlighted_text_from_document(filename, color)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Convert to PDF",
             destructiveHint=True,
@@ -659,7 +673,7 @@ def register_tools():
         """Convert a Word document to PDF format."""
         return extended_document_tools.convert_to_pdf(filename, output_filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Replace Block Below Header",
             readOnlyHint=False,
@@ -670,7 +684,7 @@ def register_tools():
         """Reemplaza el bloque de párrafos debajo de un encabezado, evitando modificar TOC."""
         return replace_paragraph_block_below_header_tool(filename, header_text, new_paragraphs, detect_block_end_fn)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Replace Block Between Anchors",
             readOnlyHint=False,
@@ -682,7 +696,7 @@ def register_tools():
         return replace_block_between_manual_anchors_tool(filename, start_anchor_text, new_paragraphs, end_anchor_text, match_fn, new_paragraph_style)
 
     # Comment tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get All Comments",
             readOnlyHint=True,
@@ -692,7 +706,7 @@ def register_tools():
         """Extract all comments from a Word document."""
         return comment_tools.get_all_comments(filename)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Comments by Author",
             readOnlyHint=True,
@@ -702,7 +716,7 @@ def register_tools():
         """Extract comments from a specific author in a Word document."""
         return comment_tools.get_comments_by_author(filename, author)
     
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Get Comments for Paragraph",
             readOnlyHint=True,
@@ -712,7 +726,7 @@ def register_tools():
         """Extract comments for a specific paragraph in a Word document."""
         return comment_tools.get_comments_for_paragraph(filename, paragraph_index)
     # Comment write tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Comment",
             readOnlyHint=False,
@@ -734,7 +748,7 @@ def register_tools():
         return comment_write_tools.add_comment(filename, target_text, comment_text, author, initials)
 
     # Hyperlink tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Manage Hyperlinks",
             readOnlyHint=False,
@@ -756,7 +770,7 @@ def register_tools():
         return hyperlink_tools.manage_hyperlinks(filename, action, text, url, paragraph_index)
 
     # New table column width tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Column Width",
             readOnlyHint=False,
@@ -768,7 +782,7 @@ def register_tools():
         """Set the width of a specific table column."""
         return format_tools.set_table_column_width(filename, table_index, col_index, width, width_type)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Column Widths",
             readOnlyHint=False,
@@ -780,7 +794,7 @@ def register_tools():
         """Set the widths of multiple table columns."""
         return format_tools.set_table_column_widths(filename, table_index, widths, width_type)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Table Width",
             readOnlyHint=False,
@@ -792,7 +806,7 @@ def register_tools():
         """Set the overall width of a table."""
         return format_tools.set_table_width(filename, table_index, width, width_type)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Auto-Fit Table Columns",
             readOnlyHint=False,
@@ -804,7 +818,7 @@ def register_tools():
         return format_tools.auto_fit_table_columns(filename, table_index)
 
     # New table cell text formatting and padding tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Format Cell Text",
             readOnlyHint=False,
@@ -819,7 +833,7 @@ def register_tools():
         return format_tools.format_table_cell_text(filename, table_index, row_index, col_index,
                                                    text_content, bold, italic, underline, color, font_size, font_name)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Cell Padding",
             readOnlyHint=False,
@@ -836,7 +850,7 @@ def register_tools():
 
 
     # Tracked changes tools
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Track Replace",
             destructiveHint=True,
@@ -846,7 +860,7 @@ def register_tools():
     def track_replace(filename: str, old_text: str, new_text: str, author: str = DEFAULT_AUTHOR):
         return tracked_changes_tools.track_replace(filename, old_text, new_text, author)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Track Insert",
             destructiveHint=True,
@@ -856,7 +870,7 @@ def register_tools():
     def track_insert(filename: str, after_text: str, insert_text: str, author: str = DEFAULT_AUTHOR):
         return tracked_changes_tools.track_insert(filename, after_text, insert_text, author)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Track Delete",
             destructiveHint=True,
@@ -866,7 +880,7 @@ def register_tools():
     def track_delete(filename: str, text: str, author: str = DEFAULT_AUTHOR):
         return tracked_changes_tools.track_delete(filename, text, author)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="List Tracked Changes",
             readOnlyHint=True,
@@ -877,7 +891,7 @@ def register_tools():
         Returns author, date, text, and paragraph context for each change."""
         return tracked_changes_tools.list_tracked_changes(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Accept Tracked Changes",
             destructiveHint=True,
@@ -888,7 +902,7 @@ def register_tools():
         Optionally filter by author or specific change IDs."""
         return tracked_changes_tools.accept_tracked_changes(filename, author, change_ids)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Reject Tracked Changes",
             destructiveHint=True,
@@ -901,7 +915,7 @@ def register_tools():
 
     # --- Live editing tools (Windows only, requires Word running) ---
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Screen Capture",
             readOnlyHint=True,
@@ -912,7 +926,7 @@ def register_tools():
         Returns the path to the saved PNG image. Requires Word to be running."""
         return screen_capture_tools.word_screen_capture(filename, output_path)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Insert Text",
             destructiveHint=True,
@@ -931,7 +945,7 @@ def register_tools():
             filename, text, position, bookmark, track_changes
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Format Text",
             destructiveHint=True,
@@ -966,7 +980,7 @@ def register_tools():
             preserve_direct_formatting, track_changes,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Replace Text",
             destructiveHint=True,
@@ -988,7 +1002,7 @@ def register_tools():
             match_whole_word, use_wildcards, replace_all, track_changes,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Insert Paragraphs",
             destructiveHint=True,
@@ -1009,7 +1023,7 @@ def register_tools():
             position, style, track_changes,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Add Table",
             destructiveHint=True,
@@ -1033,7 +1047,7 @@ def register_tools():
             filename, rows, cols, position, data, style, autofit, track_changes
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Format Table",
             destructiveHint=True,
@@ -1056,7 +1070,7 @@ def register_tools():
             column_widths, table_alignment, cell_shading, autofit
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Modify Table",
             destructiveHint=True,
@@ -1089,7 +1103,7 @@ def register_tools():
             autofit_mode, accept_revisions, track_changes,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Delete Text",
             destructiveHint=True,
@@ -1107,7 +1121,7 @@ def register_tools():
             filename, start, end, track_changes
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Apply List",
             destructiveHint=True,
@@ -1137,7 +1151,7 @@ def register_tools():
             font_color, outline_numbered,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Setup Heading Numbering",
             destructiveHint=True,
@@ -1175,7 +1189,7 @@ def register_tools():
 
     # --- Live read tools (Windows only, requires Word running) ---
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Get Text",
             readOnlyHint=True,
@@ -1185,7 +1199,7 @@ def register_tools():
         """[Windows only] Get all text from a Word document open in Word, paragraph by paragraph. For large documents (200+ paragraphs), automatically returns only the first 3 pages — use word_live_get_page_text to read specific pages."""
         return live_read_tools.word_live_get_text(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Take Snapshot",
             readOnlyHint=True,
@@ -1195,7 +1209,7 @@ def register_tools():
         """[Windows only] Store a snapshot of the current document text for later diffing without returning the full text. Use word_live_get_diff afterwards to see what changed."""
         return live_read_tools.word_live_take_snapshot(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Get Diff",
             readOnlyHint=True,
@@ -1205,7 +1219,7 @@ def register_tools():
         """[Windows only] Return only paragraphs that changed since the last snapshot. Compares current document against snapshot from word_live_take_snapshot. Returns added, modified, deleted paragraphs. Automatically updates snapshot after diffing."""
         return live_read_tools.word_live_get_diff(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Snapshot Status",
             readOnlyHint=True,
@@ -1215,7 +1229,7 @@ def register_tools():
         """[Windows only] Check whether a snapshot exists for the document and how old it is. Returns has_snapshot, age_seconds, and paragraph_count."""
         return live_read_tools.word_live_snapshot_status(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Get Paragraph Format",
             readOnlyHint=True,
@@ -1232,7 +1246,7 @@ def register_tools():
             filename, start_paragraph, end_paragraph, include_runs,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Get Info",
             readOnlyHint=True,
@@ -1242,7 +1256,7 @@ def register_tools():
         """[Windows only] Get document info (pages, words, sections, etc.) from a Word document open in Word. Requires Word running."""
         return live_read_tools.word_live_get_info(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Set Core Properties",
             destructiveHint=True,
@@ -1274,7 +1288,7 @@ def register_tools():
             last_author=last_author,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live List Open",
             readOnlyHint=True,
@@ -1284,7 +1298,7 @@ def register_tools():
         """[Windows only] List all documents currently open in Word with name, path, pages, and saved status."""
         return live_read_tools.word_live_list_open()
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Find Text",
             readOnlyHint=True,
@@ -1307,7 +1321,7 @@ def register_tools():
             use_wildcards, context_chars, max_results,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Get Comments",
             readOnlyHint=True,
@@ -1317,7 +1331,7 @@ def register_tools():
         """[Windows only] Get all comments from a Word document open in Word. Requires Word running."""
         return live_read_tools.word_live_get_comments(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Add Comment",
             destructiveHint=True,
@@ -1337,7 +1351,7 @@ def register_tools():
             filename, start, end, paragraph_index, text, author
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Reply to Comment",
             destructiveHint=True,
@@ -1356,7 +1370,7 @@ def register_tools():
             filename, comment_index, text, author
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Resolve Comment",
             destructiveHint=True,
@@ -1374,7 +1388,7 @@ def register_tools():
             filename, comment_index, resolve
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Delete Comment",
             destructiveHint=True,
@@ -1391,7 +1405,7 @@ def register_tools():
             filename, comment_index
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live List Revisions",
             readOnlyHint=True,
@@ -1401,7 +1415,7 @@ def register_tools():
         """[Windows only] List all tracked changes (revisions) in a Word document open in Word. Requires Word running."""
         return live_read_tools.word_live_list_revisions(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Accept Revisions",
             destructiveHint=True,
@@ -1418,7 +1432,7 @@ def register_tools():
             filename, author, revision_ids
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Reject Revisions",
             destructiveHint=True,
@@ -1435,7 +1449,7 @@ def register_tools():
             filename, author, revision_ids
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Get Page Text",
             readOnlyHint=True,
@@ -1451,7 +1465,7 @@ def register_tools():
             filename, page, end_page,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Get Undo History",
             readOnlyHint=True,
@@ -1462,7 +1476,7 @@ def register_tools():
         Shows MCP tool operations as named entries. Requires Word running."""
         return live_read_tools.word_live_get_undo_history(filename)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Undo",
             destructiveHint=True,
@@ -1476,7 +1490,7 @@ def register_tools():
         Each MCP tool call is one undo entry. Requires Word running."""
         return live_tools.word_live_undo(filename, times)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Save",
             destructiveHint=True,
@@ -1490,7 +1504,7 @@ def register_tools():
         Optionally save to a new path with save_as. Requires Word running."""
         return live_tools.word_live_save(filename, save_as)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Toggle Track Changes",
             destructiveHint=True,
@@ -1504,7 +1518,7 @@ def register_tools():
         If enable is omitted, toggles current state. Requires Word running."""
         return live_tools.word_live_toggle_track_changes(filename, enable)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Insert Image",
             destructiveHint=True,
@@ -1534,7 +1548,7 @@ def register_tools():
             border_color, link_to_file
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Insert Cross Reference",
             destructiveHint=True,
@@ -1559,7 +1573,7 @@ def register_tools():
             insert_position, paragraph_index, insert_as_hyperlink
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live List Cross Reference Items",
             readOnlyHint=True,
@@ -1575,7 +1589,7 @@ def register_tools():
         Requires Word running."""
         return live_tools.word_live_list_cross_reference_items(filename, ref_type)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Insert Equation",
             destructiveHint=True,
@@ -1598,7 +1612,7 @@ def register_tools():
             filename, equation, paragraph_index, position, display_mode
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Diagnose Layout",
             readOnlyHint=True,
@@ -1610,7 +1624,7 @@ def register_tools():
 
     # --- Live layout tools (Windows only, requires Word running) ---
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Set Page Layout",
             destructiveHint=True,
@@ -1635,7 +1649,7 @@ def register_tools():
             margin_left_inches, margin_right_inches,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Add Header/Footer",
             destructiveHint=True,
@@ -1655,7 +1669,7 @@ def register_tools():
             header_alignment, footer_alignment,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Add Page Numbers",
             destructiveHint=True,
@@ -1676,7 +1690,7 @@ def register_tools():
             prefix, suffix, include_total,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Add Section Break",
             destructiveHint=True,
@@ -1691,7 +1705,7 @@ def register_tools():
             filename, break_type,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Set Paragraph Spacing",
             destructiveHint=True,
@@ -1717,7 +1731,7 @@ def register_tools():
             keep_with_next, keep_together, alignment,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Add Bookmark",
             destructiveHint=True,
@@ -1734,7 +1748,7 @@ def register_tools():
             filename, paragraph_index, bookmark_name,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Word Live Add Watermark",
             destructiveHint=True,
@@ -1755,7 +1769,7 @@ def register_tools():
 
     # --- Layout, header/footer, spacing, bookmark, watermark tools ---
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Page Layout",
             destructiveHint=True,
@@ -1780,7 +1794,7 @@ def register_tools():
             margin_left_inches, margin_right_inches,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Header/Footer",
             destructiveHint=True,
@@ -1800,7 +1814,7 @@ def register_tools():
             header_alignment, footer_alignment,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Page Numbers",
             destructiveHint=True,
@@ -1821,7 +1835,7 @@ def register_tools():
             prefix, suffix, include_total,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Section Break",
             destructiveHint=True,
@@ -1831,7 +1845,7 @@ def register_tools():
         """Add a section break (new_page, continuous, even_page, odd_page)."""
         return layout_tools.add_section_break(filename, break_type)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Set Paragraph Spacing",
             destructiveHint=True,
@@ -1854,7 +1868,7 @@ def register_tools():
             space_before_pt, space_after_pt, line_spacing, line_spacing_rule,
         )
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Bookmark",
             destructiveHint=True,
@@ -1864,7 +1878,7 @@ def register_tools():
         """Add a named bookmark at a paragraph for cross-referencing."""
         return layout_tools.add_bookmark(filename, paragraph_index, bookmark_name)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Watermark",
             destructiveHint=True,
@@ -1885,7 +1899,7 @@ def register_tools():
 
     # --- Previously unregistered existing tools ---
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Table of Contents",
             destructiveHint=True,
@@ -1895,7 +1909,7 @@ def register_tools():
         """Add a table of contents based on heading styles."""
         return content_tools.add_table_of_contents(filename, title, max_level)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Merge Documents",
             destructiveHint=True,
@@ -1905,7 +1919,7 @@ def register_tools():
         """Merge multiple Word documents into a single target document."""
         return document_tools.merge_documents(target_filename, source_filenames, add_page_breaks)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Restricted Editing",
             destructiveHint=True,
@@ -1915,7 +1929,7 @@ def register_tools():
         """Add restricted editing to a document, allowing editing only in specified sections."""
         return protection_tools.add_restricted_editing(filename, password, editable_sections)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Add Digital Signature",
             destructiveHint=True,
@@ -1925,7 +1939,7 @@ def register_tools():
         """Add a digital signature to a Word document."""
         return protection_tools.add_digital_signature(filename, signer_name, reason)
 
-    @mcp.tool(
+    @register_tool(
         annotations=ToolAnnotations(
             title="Verify Document",
             readOnlyHint=True,

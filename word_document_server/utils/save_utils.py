@@ -15,10 +15,12 @@ from pathlib import Path
 
 def backup_existing(path):
     """Preserve an existing output; a failed backup aborts the overwrite."""
-    path = Path(path)
+    from word_document_server.core.path_policy import check_path
+    path = check_path(path)
     if not path.exists():
         return None
     folder = path.parent / '.word-mcp-backups'
+    check_path(folder)
     folder.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
     dest = folder / f'{path.name}.{stamp}.{uuid.uuid4().hex[:8]}.bak'
@@ -28,7 +30,8 @@ def backup_existing(path):
 
 def atomic_write_bytes(data, path, backup=True):
     """Replace only after serialization succeeds, on the same filesystem."""
-    path = Path(path)
+    from word_document_server.core.path_policy import check_path
+    path = check_path(path)
     fd, temporary = tempfile.mkstemp(prefix='.word-mcp-', suffix='.tmp', dir=path.parent)
     try:
         with os.fdopen(fd, 'wb') as output:

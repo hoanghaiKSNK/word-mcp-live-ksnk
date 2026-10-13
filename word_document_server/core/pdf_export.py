@@ -7,7 +7,8 @@ from word_document_server.utils.save_utils import atomic_write_bytes
 
 def export_open_document(doc, output):
     """Export without SaveAs (which would change the live document identity)."""
-    output = Path(output).absolute()
+    from word_document_server.core.path_policy import check_path
+    output = check_path(output)
     fd, temporary = tempfile.mkstemp(suffix='.pdf', prefix='.word-mcp-', dir=output.parent)
     os.close(fd)
     try:
@@ -25,6 +26,9 @@ def convert_in_private_word(filename, output):
     """Call on a worker thread; never Quit a user's GetActiveObject instance."""
     import pythoncom
     import win32com.client
+    from word_document_server.core.path_policy import check_path
+    filename = check_path(filename)
+    check_path(output)
     pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
     app = doc = None
     try:

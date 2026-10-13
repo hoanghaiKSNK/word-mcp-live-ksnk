@@ -103,7 +103,18 @@ async def list_available_documents(directory: str = ".") -> str:
         if not os.path.exists(directory):
             return f"Directory {directory} does not exist"
         
-        docx_files = [f for f in os.listdir(directory) if f.endswith('.docx')]
+        from word_document_server.core.path_policy import check_path
+        from word_document_server.core.coordination import DispatchError
+        check_path(directory)
+        docx_files = []
+        for name in os.listdir(directory):
+            if not name.endswith('.docx'):
+                continue
+            try:
+                check_path(os.path.join(directory, name))
+            except DispatchError:
+                continue
+            docx_files.append(name)
         
         if not docx_files:
             return f"No Word documents found in {directory}"

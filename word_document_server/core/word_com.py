@@ -78,7 +78,10 @@ def find_document(app, filename: str = None):
     if not filename:
         if app.Documents.Count == 0:
             raise ValueError("No documents are open in Word")
-        return app.ActiveDocument
+        doc = app.ActiveDocument
+        from word_document_server.core.path_policy import check_path
+        check_path(doc.FullName)
+        return doc
     is_path = ntpath.isabs(filename) or '/' in filename or '\\' in filename
     target = normalize_document_path(filename) if is_path else unicodedata.normalize('NFC', filename).casefold()
     matches, seen = [], set()
@@ -99,12 +102,16 @@ def find_document(app, filename: str = None):
     inspect(app)
     # A full path is authoritative: never fall back to a same-named document.
     if is_path and len(matches) == 1:
+        from word_document_server.core.path_policy import check_path
+        check_path(matches[0].FullName)
         return matches[0]
     for candidate in _iter_word_apps():
         inspect(candidate)
     if len(matches) > 1:
         raise ValueError(f"Ambiguous document '{filename}'. Supply its full path.")
     if matches:
+        from word_document_server.core.path_policy import check_path
+        check_path(matches[0].FullName)
         return matches[0]
     raise ValueError(f"Document '{filename}' is not open in Word.")
 

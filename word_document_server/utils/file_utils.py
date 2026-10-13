@@ -80,8 +80,12 @@ def create_document_copy(source_path: str, dest_path: Optional[str] = None) -> T
         dest_path = f"{base}_copy{ext}"
     
     try:
-        # Simple file copy
-        shutil.copy2(source_path, dest_path)
+        from word_document_server.core.path_policy import check_path
+        from word_document_server.utils.save_utils import atomic_write_bytes
+        source_path = str(check_path(source_path))
+        dest_path = str(check_path(dest_path))
+        with open(source_path, 'rb') as source:
+            atomic_write_bytes(source.read(), dest_path)
         return True, f"Document copied to {dest_path}", dest_path
     except Exception as e:
         return False, f"Failed to copy document: {str(e)}", None

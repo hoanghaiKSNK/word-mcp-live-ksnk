@@ -104,8 +104,8 @@ async def word_screen_capture(filename: str = None, output_path: str = None) -> 
             safe_name = doc.Name.replace(".docx", "").replace(".doc", "")
             output_path = os.path.join(temp_dir, f"word_capture_{safe_name}.png")
 
-        with open(output_path, "wb") as f:
-            f.write(png_bytes)
+        from word_document_server.utils.save_utils import atomic_write_bytes
+        atomic_write_bytes(png_bytes, output_path)
 
         from PIL import Image
         import io
