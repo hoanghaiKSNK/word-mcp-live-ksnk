@@ -679,11 +679,24 @@ async def word_live_get_comments(filename: str = None) -> str:
         app = doc.Application
 
         comments = []
-        for i in range(1, doc.Comments.Count + 1):
+        raw_count = doc.Comments.Count
+        ancestry_unavailable = False
+        for i in range(1, raw_count + 1):
             c = doc.Comments(i)
-            scope_text = ""
+            # Word can enumerate replies in Document.Comments after saving or
+            # reopening. A reply belongs only under its parent's Replies list.
+            # Keep the native collection index for subsequent edit tools.
             try:
-                scope_text = c.Scope.Text[:100] if c.Scope and c.Scope.Text else ""
+                if c.Ancestor is not None:
+                    continue
+            except Exception:
+                ancestry_unavailable = True  # older Word: expose the limitation
+            scope_text = ""
+            scope_start = scope_end = None
+            try:
+                scope = c.Scope
+                scope_text = scope.Text[:100] if scope and scope.Text else ""
+                scope_start, scope_end = scope.Start, scope.End
             except Exception:
                 pass
 
@@ -707,7 +720,13 @@ async def word_live_get_comments(filename: str = None) -> str:
                 "date": str(c.Date) if c.Date else "",
                 "text": str(c.Range.Text) if c.Range and c.Range.Text else "",
                 "scope": scope_text,
+                "scope_start": scope_start,
+                "scope_end": scope_end,
             }
+            try:
+                comment_data['resolved'] = bool(c.Done)
+            except Exception:
+                pass
             if replies:
                 comment_data["replies"] = replies
                 comment_data["reply_count"] = len(replies)
@@ -717,6 +736,8 @@ async def word_live_get_comments(filename: str = None) -> str:
             "success": True,
             "document": doc.Name,
             "comment_count": len(comments),
+            "raw_comment_count": raw_count,
+            "ancestry_unavailable": ancestry_unavailable,
             "comments": comments,
         }, ensure_ascii=False)
 
@@ -1678,6 +1699,15 @@ async def word_live_list_open() -> str:
 
             entry["name"] = _get("Name")
             entry["full_path"] = _get("FullName")
+            from word_document_server.core.path_policy import check_path, roots
+            from word_document_server.core.coordination import DispatchError
+            if roots():
+                try:
+                    if not entry['full_path']:
+                        continue
+                    check_path(entry['full_path'])
+                except DispatchError:
+                    continue
             entry["saved"] = _get("Saved", bool)
             entry["track_revisions"] = _get("TrackRevisions", bool)
 

@@ -230,3 +230,77 @@ def test_cursor_cannot_edit_another_document(document):
         assert doc.Content.Text==doc_before and other.Content.Text==other_before
     finally:
         other.Close(SaveChanges=0)
+
+
+def test_comment_anchor_survives_outside_edits_save_and_word_reopen(document):
+    doc = document
+    start = doc.Content.Text.index('KSNK')
+    call(live_read_tools.word_live_add_comment, filename=doc.FullName, start=start,
+         end=start + 4, text='Neo KSNK phải còn đúng', author='KSNK Test')
+    call(live_read_tools.word_live_reply_to_comment, filename=doc.FullName, comment_index=1,
+         text='Phản hồi giữ nguyên', author='KSNK Test')
+    call(live_tools.word_live_insert_text, filename=doc.FullName, position='start', text='Đầu tài liệu. ')
+    call(live_tools.word_live_replace_text, filename=doc.FullName,
+         find_text='Cuối tài liệu', replace_text='Phần kết luận', track_changes=True)
+    assert doc.Comments(1).Scope.Text == 'KSNK'
+    assert doc.Comments(1).Scope.Start == start + len('Đầu tài liệu. ')
+    call(live_tools.word_live_save, filename=doc.FullName)
+    saved = doc.FullName
+    # A separate read-only Word open checks persisted anchors and threaded replies.
+    # Avoid closing the fixture's original COM document proxy.
+    import shutil
+    folder = Path(saved).parent
+    copy = folder / 'anchor reopen.docx'
+    shutil.copy2(saved, copy)
+    reopened = doc.Application.Documents.Open(str(copy), ReadOnly=True, AddToRecentFiles=False)
+    try:
+        report = call(live_read_tools.word_live_get_comments, filename=reopened.FullName)
+        assert report['comment_count'] == 1
+        assert not report['ancestry_unavailable']
+        parent = report['comments'][0]
+        assert parent['scope'] == 'KSNK'
+        assert parent['reply_count'] == 1
+        assert 'Phản hồi giữ nguyên' in parent['replies'][0]['text']
+        assert reopened.Comments(parent['index']).Replies.Count == 1
+        assert reopened.Revisions.Count > 0
+    finally:
+        reopened.Close(SaveChanges=0)
+
+
+def test_replace_across_format_runs_keeps_unaffected_format_and_undo(document):
+    doc = document
+    doc.TrackRevisions = False
+    doc.Content.Text = 'Trước ABCDEF sau.\r'
+    start = doc.Content.Text.index('ABCDEF')
+    doc.Range(start, start + 3).Font.Bold = True
+    doc.Range(start + 3, start + 6).Font.Italic = True
+    tail = doc.Content.Text.index('sau')
+    doc.Range(tail, tail + 3).Font.Underline = 1
+    before = doc.Content.Text
+    result = call(live_tools.word_live_replace_text, filename=doc.FullName,
+                  find_text='ABCDEF', replace_text='KSNK', track_changes=True)
+    assert result['replacements'] == 1
+    # Word-native Find spans formatting runs. No promise is made that all old
+    # per-character styles map to a replacement of a different length.
+    search = doc.Content.Duplicate
+    assert search.Find.Execute(FindText='sau')
+    assert search.Font.Underline == 1
+    assert doc.Undo(1) and doc.Content.Text == before
+    assert doc.Range(start, start + 3).Font.Bold
+    assert doc.Range(start + 3, start + 6).Font.Italic
+
+
+def test_interrupted_edit_restores_settings_and_can_be_undone(document):
+    doc = document; app = doc.Application
+    before = doc.Content.Text
+    settings = (bool(doc.TrackRevisions), app.UserName, bool(app.ScreenUpdating))
+    with pytest.raises(RuntimeError, match='injected failure'):
+        with word_com.edit_session(app, doc, 'Synthetic failure test', True):
+            doc.Range(0, 0).InsertBefore('Thay đổi trước lỗi. ')
+            raise RuntimeError('injected failure')
+    assert (bool(doc.TrackRevisions), app.UserName, bool(app.ScreenUpdating)) == settings
+    # A failed operation can have changed Word. We inspect and Undo explicitly.
+    assert doc.Content.Text != before
+    assert doc.Undo(1) and doc.Content.Text == before
+    call(live_tools.word_live_insert_text, filename=doc.FullName, position='start', text='Phục hồi. ')
+    assert doc.Content.Text.startswith('Phục hồi. ')
