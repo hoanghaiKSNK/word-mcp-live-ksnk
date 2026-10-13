@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.21+ksnk.1] - 2026-10-13
+
+### Fixed
+- Full paths match only the requested document; ambiguous basenames fail before edits. Use the target document's Application for undo and author state.
+- Preserve an existing custom Undo record; restore screen updating, author and tracking on errors. Group each live edit into one Undo entry.
+- Tracked replace-all preflights matches and edits right-to-left instead of revisiting tracked deletions. It preserves inherited Track Changes, rejects structural cell matches and fails before editing at the safety ceiling.
+- Bulk table writes preflight dimensions, controls and merged-cell aliases; cell terminators stay intact. Range deletion adjusts offsets after deleting enclosed tables.
+- Atomic python-docx saves preserve the source OPC parts and back up existing outputs. Do not inject unrelated destination comments.
+- PDF export uses ExportAsFixedFormat; file conversion owns a separate Word instance and never quits the user's instance. Back up existing output files.
+- Preserve header/footer content and active selection when adding page fields; isolate the requested section. Reject duplicate PAGE fields and invalid formatting inputs.
+- Cross-reference insertion uses a document range, correct Word enums and bookmark names instead of the active selection. Native caption lookup supports localized Word. Report the actual package version.
+
+### Performance
+- Serialize Windows live tools on a dedicated COM STA with a bounded queue. MCP's event loop remains responsive; queued cancellations do not start edits. Started COM operations finish without automatic retries.
+- Page reads enumerate only the requested range's paragraphs rather than scanning from the first paragraph on every call. Snapshot keys include full paths.
+
+### Validation
+- Synthetic regression tests, opt-in Windows Word integration tests and stdio MCP smoke tests. See README_KSNK.md for scope and recovery instructions. macOS JXA has not been runtime-tested for this fork update.
+
 ## [1.6.0] - 2026-04-29
 
 ### Added

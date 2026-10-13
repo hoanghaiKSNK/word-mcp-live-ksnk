@@ -99,6 +99,8 @@ mcp = FastMCP("Word Document Server")
 
 def register_tools():
     """Register all tools with the MCP server using FastMCP decorators."""
+    from word_document_server.core.sta_dispatch import install_sta_dispatch
+    install_sta_dispatch(live_tools, live_read_tools, live_layout_tools)
     
     # Document tools (create, copy, info, etc.)
     @mcp.tool(

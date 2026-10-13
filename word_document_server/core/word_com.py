@@ -5,6 +5,7 @@ Only works on Windows with pywin32 installed.
 """
 
 import os
+import ntpath
 import sys
 import unicodedata
 from contextlib import contextmanager
@@ -54,57 +55,9 @@ def _find_word_with_docs():
 
     Returns the Word.Application COM object if found, or None.
     """
-    try:
-        import pythoncom
-        import win32com.client
-
-        rot = pythoncom.GetRunningObjectTable(0)
-        enum = rot.EnumRunning()
-
-        # Pass 1: look for a Word.Application ROT entry with documents
-        monikers_to_retry = []
-        while True:
-            batch = enum.Next(1)
-            if not batch:
-                break
-            moniker = batch[0]
-            try:
-                ctx = pythoncom.CreateBindCtx(0)
-                name = moniker.GetDisplayName(ctx, None)
-                obj = rot.GetObject(moniker)
-                dispatch = obj.QueryInterface(pythoncom.IID_IDispatch)
-                com_obj = win32com.client.Dispatch(dispatch)
-                # Direct Application entry
-                if hasattr(com_obj, "Documents") and hasattr(com_obj, "ActiveDocument"):
-                    if com_obj.Documents.Count > 0:
-                        return com_obj
-                # Remember file monikers for pass 2
-                if name and (name.lower().endswith(".docx") or name.lower().endswith(".doc")):
-                    monikers_to_retry.append((name, moniker))
-            except Exception:
-                # Also collect file monikers we couldn't QI yet
-                try:
-                    ctx = pythoncom.CreateBindCtx(0)
-                    name = moniker.GetDisplayName(ctx, None)
-                    if name and (name.lower().endswith(".docx") or name.lower().endswith(".doc")):
-                        monikers_to_retry.append((name, moniker))
-                except Exception:
-                    pass
-                continue
-
-        # Pass 2: try file monikers → Document → Application
-        for name, moniker in monikers_to_retry:
-            try:
-                obj = rot.GetObject(moniker)
-                dispatch = obj.QueryInterface(pythoncom.IID_IDispatch)
-                doc = win32com.client.Dispatch(dispatch)
-                app = doc.Application
-                if app.Documents.Count > 0:
-                    return app
-            except Exception:
-                continue
-    except Exception:
-        pass
+    for app in _iter_word_apps():
+        if app.Documents.Count > 0:
+            return app
     return None
 
 
@@ -122,30 +75,75 @@ def find_document(app, filename: str = None):
     Raises:
         ValueError: If the document is not found or no documents are open.
     """
-    if app.Documents.Count == 0:
-        raise ValueError("No documents are open in Word")
-
     if not filename:
+        if app.Documents.Count == 0:
+            raise ValueError("No documents are open in Word")
         return app.ActiveDocument
+    is_path = ntpath.isabs(filename) or '/' in filename or '\\' in filename
+    target = normalize_document_path(filename) if is_path else unicodedata.normalize('NFC', filename).casefold()
+    matches, seen = [], set()
 
-    target_basename = unicodedata.normalize('NFC', os.path.basename(filename)).lower()
-    target_fullpath = (
-        unicodedata.normalize('NFC', os.path.normpath(filename)).lower()
-        if os.path.isabs(filename) else None
-    )
+    def inspect(candidate):
+        docs = candidate.Documents
+        for i in range(1, docs.Count + 1):
+            doc = docs(i)
+            full = normalize_document_path(doc.FullName)
+            identity = (getattr(getattr(doc, 'Windows', None), 'Count', 0) and doc.Windows(1).Hwnd, full)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            key = full if is_path else unicodedata.normalize('NFC', doc.Name).casefold()
+            if key == target:
+                matches.append(doc)
 
-    for i in range(1, app.Documents.Count + 1):
-        doc = app.Documents(i)
-        if unicodedata.normalize('NFC', doc.Name).lower() == target_basename:
-            return doc
-        if target_fullpath and unicodedata.normalize('NFC', os.path.normpath(doc.FullName)).lower() == target_fullpath:
-            return doc
+    inspect(app)
+    # A full path is authoritative: never fall back to a same-named document.
+    if is_path and len(matches) == 1:
+        return matches[0]
+    for candidate in _iter_word_apps():
+        inspect(candidate)
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous document '{filename}'. Supply its full path.")
+    if matches:
+        return matches[0]
+    raise ValueError(f"Document '{filename}' is not open in Word.")
 
-    open_docs = [app.Documents(i).Name for i in range(1, app.Documents.Count + 1)]
-    raise ValueError(
-        f"Document '{filename}' is not open in Word. "
-        f"Open documents: {open_docs}"
-    )
+
+def normalize_document_path(path):
+    """Case-insensitive Windows path identity, including Unicode normalization."""
+    path = str(path)
+    if '://' not in path:
+        path = ntpath.normpath(path if ntpath.isabs(path) else os.path.abspath(path))
+    return unicodedata.normalize('NFC', path).casefold()
+
+
+def _iter_word_apps():
+    """Bind only Word/file ROT entries; never probe every other running app."""
+    if sys.platform != 'win32':
+        return
+    import pythoncom
+    import win32com.client
+    rot = pythoncom.GetRunningObjectTable(0)
+    enum = rot.EnumRunning()
+    seen = set()
+    while True:
+        batch = enum.Next(1)
+        if not batch:
+            break
+        try:
+            moniker = batch[0]
+            name = moniker.GetDisplayName(pythoncom.CreateBindCtx(0), None).lower()
+            is_app = '000209ff' in name
+            if not is_app and not name.endswith(('.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm')):
+                continue
+            obj = win32com.client.Dispatch(rot.GetObject(moniker).QueryInterface(pythoncom.IID_IDispatch))
+            candidate = obj if is_app else obj.Application
+            key = candidate.ActiveWindow.Hwnd
+            if key not in seen:
+                seen.add(key)
+                yield candidate
+        except Exception:
+            continue
 
 
 @contextmanager
@@ -165,23 +163,44 @@ def undo_record(app, name: str):
         with undo_record(app, "MCP: Insert Text"):
             doc.Range(0, 0).InsertBefore("Hello")
     """
-    rec = None
     try:
         rec = app.UndoRecord
-        # Clean up stale undo record from a previous crash/interrupted session
+    except AttributeError:
+        rec = None  # Legacy Word without UndoRecord support.
+    if rec is not None:
         if rec.IsRecordingCustomRecord:
-            try:
-                rec.EndCustomRecord()
-            except Exception:
-                pass
+            raise RuntimeError('Word already has an active custom Undo record. Finish it before editing.')
         rec.StartCustomRecord(name[:64])
-    except Exception:
-        rec = None  # Word 2007 or earlier — proceed without
+    previous_screen = None
     try:
+        try:
+            previous_screen = app.ScreenUpdating
+            app.ScreenUpdating = False
+        except AttributeError:
+            pass
         yield
     finally:
-        if rec is not None:
-            try:
+        try:
+            if rec is not None:
                 rec.EndCustomRecord()
-            except Exception:
-                pass
+        finally:
+            if previous_screen is not None:
+                app.ScreenUpdating = previous_screen
+
+
+@contextmanager
+def edit_session(app, doc, name, track_changes=False):
+    """Restore author and tracking even if COM setup or the edit fails."""
+    from word_document_server.defaults import DEFAULT_AUTHOR
+    previous_track, previous_author = doc.TrackRevisions, app.UserName
+    with undo_record(app, name):
+        try:
+            if track_changes:
+                doc.TrackRevisions = True
+                app.UserName = DEFAULT_AUTHOR
+            yield
+        finally:
+            try:
+                doc.TrackRevisions = previous_track
+            finally:
+                app.UserName = previous_author

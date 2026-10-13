@@ -63,6 +63,7 @@ async def word_live_set_page_layout(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if section_index < 1 or section_index > doc.Sections.Count:
             return json.dumps({
@@ -145,6 +146,7 @@ async def word_live_add_header_footer(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if section_index < 1 or section_index > doc.Sections.Count:
             return json.dumps({
@@ -221,56 +223,50 @@ async def word_live_add_page_numbers(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if section_index < 1 or section_index > doc.Sections.Count:
             return json.dumps({
                 "error": f"Section {section_index} out of range (1-{doc.Sections.Count})"
             })
 
+        if position not in ('header', 'footer') or alignment not in ('left', 'center', 'right'):
+            raise ValueError('Invalid page-number position or alignment')
+        from word_document_server.utils.text_safety import reject_control_chars
+        reject_control_chars('prefix', prefix)
+        reject_control_chars('suffix', suffix)
+        section = doc.Sections(section_index)
+        target = section.Headers(1) if position == 'header' else section.Footers(1)
+        if any(field.Type == 33 for field in target.Range.Fields):
+            raise ValueError('This header/footer already has a PAGE field; edit it instead of adding a duplicate')
         with undo_record(app, "MCP: Add Page Numbers"):
-            # PageNumberAlignment: 0=left, 1=center, 2=right
-            align_map = {"left": 0, "center": 1, "right": 2}
-            pn_alignment = align_map.get(alignment.lower(), 1)
-
-            section = doc.Sections(section_index)
-            # wdHeaderFooterPrimary = 1
-            target = section.Headers(1) if position == "header" else section.Footers(1)
-
-            # Add page numbers via PageNumbers collection
-            target.PageNumbers.Add(PageNumberAlignment=pn_alignment)
-
-            # Add prefix/suffix/total by editing the range
-            if prefix or suffix or include_total:
-                rng = target.Range
-                existing_text = rng.Text
-
-                # Build the text with field codes
-                # Clear and rebuild
-                rng.Delete()
-
-                if prefix:
-                    rng.InsertAfter(prefix)
-
-                # Insert PAGE field
-                # wdFieldPage = 33
-                rng.Collapse(0)  # wdCollapseEnd
-                app.Selection.GoTo(What=1, Name=str(section_index))  # navigate to section
-                field_range = target.Range
-                field_range.Collapse(0)
-                doc.Fields.Add(Range=field_range, Type=33)  # wdFieldPage
-
-                if include_total:
-                    end_range = target.Range
-                    end_range.Collapse(0)
-                    end_range.InsertAfter(" / ")
-                    end_range = target.Range
-                    end_range.Collapse(0)
-                    doc.Fields.Add(Range=end_range, Type=26)  # wdFieldNumPages
-
-                if suffix:
-                    end_range = target.Range
-                    end_range.Collapse(0)
-                    end_range.InsertAfter(suffix)
+            # Isolate the requested section while retaining its existing contents.
+            if section_index > 1:
+                target.LinkToPrevious = False
+            rng = target.Range.Duplicate
+            rng.End -= 1
+            rng.Collapse(0)
+            if target.Range.Text.rstrip('\r\x07'):
+                rng.InsertAfter('\r')
+                rng.Collapse(0)
+            rng.ParagraphFormat.Alignment = {'left': 0, 'center': 1, 'right': 2}[alignment]
+            if prefix:
+                rng.InsertAfter(prefix)
+                rng.Collapse(0)
+            field = target.Range.Fields.Add(Range=rng, Type=33)
+            rng = field.Result.Duplicate
+            rng.Collapse(0)
+            # Move beyond the field terminator before appending text/fields.
+            rng.SetRange(rng.End + 1, rng.End + 1)
+            if include_total:
+                rng.InsertAfter(' / ')
+                rng.Collapse(0)
+                field = target.Range.Fields.Add(Range=rng, Type=26)
+                rng = field.Result.Duplicate
+                rng.Collapse(0)
+                rng.SetRange(rng.End + 1, rng.End + 1)
+            if suffix:
+                rng.InsertAfter(suffix)
 
         return json.dumps({
             "success": True,
@@ -310,6 +306,7 @@ async def word_live_add_section_break(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # wdSectionBreakNextPage=2, Continuous=3, EvenPage=4, OddPage=5
         type_map = {
@@ -388,6 +385,7 @@ async def word_live_set_paragraph_spacing(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         total = doc.Paragraphs.Count
 
@@ -401,9 +399,21 @@ async def word_live_set_paragraph_spacing(
             "multiple": 5,
         }
 
+        import math
+        if line_spacing_rule is not None and line_spacing_rule not in rule_map:
+            raise ValueError('Invalid line_spacing_rule')
+        if alignment is not None and alignment not in ('left', 'center', 'right', 'justify'):
+            raise ValueError('Invalid alignment')
+        for value in (space_before_pt, space_after_pt, line_spacing):
+            if value is not None and (not math.isfinite(value) or value < 0):
+                raise ValueError('Spacing must be finite and non-negative')
+        if (start_paragraph is None) != (end_paragraph is None):
+            raise ValueError('Supply both start_paragraph and end_paragraph')
         # Determine range of paragraphs (1-indexed)
         if start_paragraph is not None and end_paragraph is not None:
-            indices = range(max(1, start_paragraph), min(end_paragraph + 1, total + 1))
+            if not 1 <= start_paragraph <= end_paragraph <= total:
+                raise ValueError("Invalid paragraph range")
+            indices = range(start_paragraph, end_paragraph + 1)
         elif paragraph_index is not None:
             if paragraph_index < 1 or paragraph_index > total:
                 return json.dumps({
@@ -475,6 +485,7 @@ async def word_live_add_bookmark(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if paragraph_index < 1 or paragraph_index > doc.Paragraphs.Count:
             return json.dumps({
@@ -528,6 +539,7 @@ async def word_live_add_watermark(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if section_index < 1 or section_index > doc.Sections.Count:
             return json.dumps({

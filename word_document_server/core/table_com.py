@@ -5,6 +5,35 @@ Used by live_tools.word_live_modify_table.
 All row/col indices are 1-based (Word COM standard).
 """
 
+from word_document_server.utils.text_safety import reject_control_chars
+
+
+def _preflight_writes(table, writes):
+    """Resolve every target before changing anything, including merged aliases."""
+    ready, seen = [], set()
+    for row, col, value in writes:
+        _validate_cell(table, row, col)
+        if value is None:
+            continue
+        text = str(value)
+        reject_control_chars('cell text', text)
+        cell = table.Cell(row, col)
+        identity = (cell.Range.Start, cell.Range.End)
+        if identity in seen:
+            raise ValueError('Merged cell aliases in bulk write; use individual cell operations.')
+        seen.add(identity)
+        ready.append((row, col, cell, text))
+    return ready
+
+
+def _write_cell(cell, text, accept_revisions=False):
+    if accept_revisions and cell.Range.Revisions.Count:
+        cell.Range.Revisions.AcceptAll()
+    # The cell terminator is structural, never replace it with user text.
+    rng = cell.Range.Duplicate
+    rng.End -= 1
+    rng.Text = text
+
 
 def get_info(table):
     """Return table structure: dimensions and cell contents.
@@ -34,13 +63,8 @@ def get_info(table):
 
 def set_cell(table, row, col, text, accept_revisions=False):
     """Set cell text at (row, col). accept_revisions=True clears tracked changes first."""
-    _validate_cell(table, row, col)
-    cell = table.Cell(row, col)
-    if accept_revisions:
-        revs = cell.Range.Revisions
-        if revs.Count > 0:
-            revs.AcceptAll()
-    cell.Range.Text = text
+    for _, _, cell, value in _preflight_writes(table, [(row, col, text)]):
+        _write_cell(cell, value, accept_revisions)
     return {"row": row, "col": col, "text": text}
 
 
@@ -57,6 +81,11 @@ def add_column(table, before_col=None, header=None, cells=None):
         dict with new_col index and total_cols.
     """
     total = table.Columns.Count
+    values = ([str(header)] if header is not None else []) + [str(x) for x in (cells or [])]
+    if len(values) > table.Rows.Count:
+        raise ValueError('Too many values for the new column')
+    for value in values:
+        reject_control_chars('cell text', value)
     if before_col is not None:
         if before_col < 1 or before_col > total + 1:
             raise ValueError(f"before_col {before_col} out of range (1-{total + 1})")
@@ -71,14 +100,14 @@ def add_column(table, before_col=None, header=None, cells=None):
         new_col = table.Columns.Count
 
     if header is not None:
-        table.Cell(1, new_col).Range.Text = str(header)
+        _write_cell(table.Cell(1, new_col), str(header))
     if cells:
         start_row = 2 if header is not None else 1
         for i, val in enumerate(cells):
             r = start_row + i
             if r > table.Rows.Count:
                 break
-            table.Cell(r, new_col).Range.Text = str(val)
+            _write_cell(table.Cell(r, new_col), str(val))
 
     return {"new_col": new_col, "total_cols": table.Columns.Count}
 
@@ -103,6 +132,10 @@ def add_row(table, before_row=None, cells=None):
         dict with new_row index and total_rows.
     """
     total = table.Rows.Count
+    if len(cells or []) > table.Columns.Count:
+        raise ValueError('Too many values for the new row')
+    for value in cells or []:
+        reject_control_chars('cell text', str(value))
     if before_row is not None:
         if before_row < 1 or before_row > total + 1:
             raise ValueError(f"before_row {before_row} out of range (1-{total + 1})")
@@ -121,7 +154,7 @@ def add_row(table, before_row=None, cells=None):
             c = i + 1
             if c > table.Columns.Count:
                 break
-            table.Cell(new_row, c).Range.Text = str(val)
+            _write_cell(table.Cell(new_row, c), str(val))
 
     return {"new_row": new_row, "total_rows": table.Rows.Count}
 
@@ -138,6 +171,8 @@ def merge_cells(table, start_row, start_col, end_row, end_col):
     """Merge cells in a rectangular area. All indices 1-based."""
     _validate_cell(table, start_row, start_col)
     _validate_cell(table, end_row, end_col)
+    if start_row > end_row or start_col > end_col:
+        raise ValueError('Merge start must precede end')
     table.Cell(start_row, start_col).Merge(table.Cell(end_row, end_col))
     return {"merged": f"({start_row},{start_col})-({end_row},{end_col})"}
 
@@ -166,19 +201,12 @@ def set_row(table, row, cells, accept_revisions=False):
     """
     if row < 1 or row > table.Rows.Count:
         raise ValueError(f"Row {row} out of range (1-{table.Rows.Count})")
+    if not isinstance(cells, list) or len(cells) > table.Columns.Count:
+        raise ValueError('cells must be a list fitting the row')
+    ready = _preflight_writes(table, [(row, i + 1, val) for i, val in enumerate(cells)])
     updated = []
-    for i, val in enumerate(cells):
-        c = i + 1
-        if c > table.Columns.Count:
-            break
-        if val is None:
-            continue
-        cell = table.Cell(row, c)
-        if accept_revisions:
-            revs = cell.Range.Revisions
-            if revs.Count > 0:
-                revs.AcceptAll()
-        cell.Range.Text = str(val)
+    for _, c, cell, text in ready:
+        _write_cell(cell, text, accept_revisions)
         updated.append(c)
     return {"row": row, "cells_updated": updated, "total_cols": table.Columns.Count}
 
@@ -196,24 +224,15 @@ def set_range(table, data, start_row=1, start_col=1, accept_revisions=False):
     Returns:
         dict with cells_updated count, start position, and data dimensions.
     """
+    if not isinstance(data, list) or any(not isinstance(row, list) for row in data):
+        raise ValueError('data must be a list of row lists')
+    _validate_cell(table, start_row, start_col)
+    ready = _preflight_writes(table, [(start_row + ri, start_col + ci, val)
+                                    for ri, row in enumerate(data) for ci, val in enumerate(row)])
     updated = []
-    for ri, row_data in enumerate(data):
-        r = start_row + ri
-        if r > table.Rows.Count:
-            break
-        for ci, val in enumerate(row_data):
-            c = start_col + ci
-            if c > table.Columns.Count:
-                break
-            if val is None:
-                continue
-            cell = table.Cell(r, c)
-            if accept_revisions:
-                revs = cell.Range.Revisions
-                if revs.Count > 0:
-                    revs.AcceptAll()
-            cell.Range.Text = str(val)
-            updated.append([r, c])
+    for r, c, cell, text in ready:
+        _write_cell(cell, text, accept_revisions)
+        updated.append([r, c])
     return {
         "cells_updated": len(updated),
         "start": [start_row, start_col],
@@ -261,7 +280,7 @@ def delete_table(table, scrub_orphans: bool = True):
                 for i in range(len(text) - 1, -1, -1):
                     if text[i] != "\x07":
                         continue
-                    pos = scan_start + i
+                    pos = scan_start + len(text[:i].encode('utf-16-le')) // 2
                     if any(s <= pos <= e for (s, e) in in_table_ranges):
                         continue  # belongs to a real surviving table
                     try:

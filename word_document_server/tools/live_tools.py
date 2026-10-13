@@ -10,6 +10,7 @@ import re
 import sys
 
 from word_document_server.defaults import DEFAULT_AUTHOR
+from word_document_server.core.word_com import edit_session
 # macOS JXA dispatch
 _MAC_AVAILABLE = __import__('sys').platform == 'darwin'
 
@@ -55,6 +56,7 @@ async def word_live_insert_text(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # Convert literal escape sequences to actual characters.
         # MCP/JSON sends backslash-r as 2 chars; Word COM needs chr(13) for paragraph marks.
@@ -69,53 +71,46 @@ async def word_live_insert_text(
         except ValueError as e:
             return json.dumps({"error": str(e)})
 
-        with undo_record(app, "MCP: Insert Text"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
+        if not bookmark and position == "cursor":
+            from word_document_server.core.word_com import normalize_document_path
+            if normalize_document_path(app.Selection.Document.FullName) != normalize_document_path(doc.FullName):
+                raise ValueError('Cursor belongs to another document; use an explicit offset or activate the target document')
+        with edit_session(app, doc, 'MCP: Insert Text', track_changes):
+            chunks = [text[i:i + _INSERT_CHUNK_SIZE]
+                      for i in range(0, max(len(text), 1), _INSERT_CHUNK_SIZE)]
 
-            try:
-                chunks = [text[i:i + _INSERT_CHUNK_SIZE]
-                          for i in range(0, max(len(text), 1), _INSERT_CHUNK_SIZE)]
-
-                if bookmark:
-                    if not doc.Bookmarks.Exists(bookmark):
-                        return json.dumps({"error": f"Bookmark '{bookmark}' not found"})
-                    rng = doc.Bookmarks(bookmark).Range
-                    for chunk in chunks:
-                        rng.InsertAfter(chunk)
-                        rng.Collapse(0)  # wdCollapseEnd
-                elif position == "start":
-                    # InsertBefore: reverse order so first chunk ends up first
-                    for chunk in reversed(chunks):
-                        doc.Range(0, 0).InsertBefore(chunk)
-                elif position == "end":
-                    for chunk in chunks:
-                        end_pos = doc.Content.End - 1
-                        rng = doc.Range(end_pos, end_pos)
-                        rng.InsertAfter(chunk)
-                elif position == "cursor":
-                    for chunk in chunks:
-                        app.Selection.TypeText(chunk)
-                else:
-                    try:
-                        offset = int(position)
-                    except ValueError:
-                        return json.dumps(
-                            {
-                                "error": f"Invalid position: {position}. "
-                                "Use 'start', 'end', 'cursor', or a character offset."
-                            }
-                        )
-                    # InsertBefore at offset: reverse order so first chunk ends up at offset
-                    for chunk in reversed(chunks):
-                        doc.Range(offset, offset).InsertBefore(chunk)
-            finally:
-                if track_changes:
-                    doc.TrackRevisions = prev_tracking
-                    app.UserName = prev_author
+            if bookmark:
+                if not doc.Bookmarks.Exists(bookmark):
+                    return json.dumps({"error": f"Bookmark '{bookmark}' not found"})
+                rng = doc.Bookmarks(bookmark).Range
+                for chunk in chunks:
+                    rng.InsertAfter(chunk)
+                    rng.Collapse(0)  # wdCollapseEnd
+            elif position == "start":
+                # InsertBefore: reverse order so first chunk ends up first
+                for chunk in reversed(chunks):
+                    doc.Range(0, 0).InsertBefore(chunk)
+            elif position == "end":
+                for chunk in chunks:
+                    end_pos = doc.Content.End - 1
+                    rng = doc.Range(end_pos, end_pos)
+                    rng.InsertAfter(chunk)
+            elif position == "cursor":
+                for chunk in chunks:
+                    app.Selection.TypeText(chunk)
+            else:
+                try:
+                    offset = int(position)
+                except ValueError:
+                    return json.dumps(
+                        {
+                            "error": f"Invalid position: {position}. "
+                            "Use 'start', 'end', 'cursor', or a character offset."
+                        }
+                    )
+                # InsertBefore at offset: reverse order so first chunk ends up at offset
+                for chunk in reversed(chunks):
+                    doc.Range(offset, offset).InsertBefore(chunk)
 
         result = {
             "success": True,
@@ -202,13 +197,22 @@ async def word_live_format_text(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
+        if paragraph_alignment is not None and paragraph_alignment not in ('left', 'center', 'right', 'justify'):
+            raise ValueError('Invalid paragraph alignment')
+        if font_color is not None and not re.fullmatch(r'#?[0-9a-fA-F]{6}', font_color):
+            raise ValueError('font_color must be #RRGGBB')
+        if font_size is not None and not 1 <= font_size <= 1638:
+            raise ValueError('font_size out of range')
+        if style_name is not None:
+            doc.Styles(style_name)  # Resolve before formatting anything.
         # Resolve addressing mode
         if start_paragraph is not None:
             if end_paragraph is None:
                 end_paragraph = start_paragraph
             total_paras = doc.Paragraphs.Count
-            if start_paragraph < 1 or end_paragraph > total_paras:
+            if not 1 <= start_paragraph <= end_paragraph <= total_paras:
                 return json.dumps({
                     "error": f"Paragraph range {start_paragraph}-{end_paragraph} out of bounds (doc has {total_paras} paragraphs)"
                 })
@@ -217,6 +221,8 @@ async def word_live_format_text(
             rng = doc.Range(p_start, p_end)
             range_label = f"para {start_paragraph}-{end_paragraph}"
         elif start is not None and end is not None:
+            if not 0 <= start <= end <= doc.Content.End:
+                raise ValueError("Invalid character range")
             rng = doc.Range(start, end)
             range_label = f"{start}-{end}"
         else:
@@ -224,91 +230,79 @@ async def word_live_format_text(
                 {"error": "Provide start/end character positions OR start_paragraph/end_paragraph"}
             )
 
-        with undo_record(app, "MCP: Format Text"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
+        with edit_session(app, doc, 'MCP: Format Text', track_changes):
+            saved_formats = []
+            if preserve_direct_formatting and style_name is not None:
+                for para in rng.Paragraphs:
+                    pr = para.Range
+                    pf = para.Format
+                    saved_formats.append({
+                        "para": para,
+                        "font_name": str(pr.Font.Name) if pr.Font.Name and pr.Font.Name != 9999999 else None,
+                        "font_size": pr.Font.Size if pr.Font.Size and pr.Font.Size != 9999999 else None,
+                        "bold": pr.Font.Bold if pr.Font.Bold != 9999999 else None,
+                        "italic": pr.Font.Italic if pr.Font.Italic != 9999999 else None,
+                        "strikethrough": pr.Font.StrikeThrough if pr.Font.StrikeThrough != 9999999 else None,
+                        "alignment": pf.Alignment,
+                        "space_before": pf.SpaceBefore,
+                        "space_after": pf.SpaceAfter,
+                        "line_spacing": pf.LineSpacing,
+                        "line_spacing_rule": pf.LineSpacingRule,
+                    })
 
-            try:
-                # Save direct formatting before style change if requested
-                saved_formats = []
-                if preserve_direct_formatting and style_name is not None:
-                    for para in rng.Paragraphs:
-                        pr = para.Range
-                        pf = para.Format
-                        saved_formats.append({
-                            "para": para,
-                            "font_name": str(pr.Font.Name) if pr.Font.Name and pr.Font.Name != 9999999 else None,
-                            "font_size": pr.Font.Size if pr.Font.Size and pr.Font.Size != 9999999 else None,
-                            "bold": pr.Font.Bold if pr.Font.Bold != 9999999 else None,
-                            "italic": pr.Font.Italic if pr.Font.Italic != 9999999 else None,
-                            "strikethrough": pr.Font.StrikeThrough if pr.Font.StrikeThrough != 9999999 else None,
-                            "alignment": pf.Alignment,
-                            "space_before": pf.SpaceBefore,
-                            "space_after": pf.SpaceAfter,
-                            "line_spacing": pf.LineSpacing,
-                            "line_spacing_rule": pf.LineSpacingRule,
-                        })
-
-                if bold is not None:
-                    rng.Font.Bold = bold
-                if italic is not None:
-                    rng.Font.Italic = italic
-                if underline is not None:
-                    rng.Font.Underline = 1 if underline else 0
-                if strikethrough is not None:
-                    rng.Font.StrikeThrough = strikethrough
-                if font_name is not None:
-                    rng.Font.Name = font_name
-                if font_size is not None:
-                    rng.Font.Size = font_size
-                if font_color is not None:
-                    c = font_color.lstrip("#")
-                    r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
-                    rng.Font.Color = r + (g << 8) + (b << 16)
-                if highlight_color is not None:
-                    rng.HighlightColorIndex = highlight_color
-                if style_name is not None:
-                    if preserve_direct_formatting:
-                        # Apply style per-paragraph and restore formatting
-                        for sf in saved_formats:
-                            p = sf["para"]
-                            p.Style = doc.Styles(style_name)
-                            pr = p.Range
-                            pf = p.Format
-                            if sf["font_name"] is not None:
-                                pr.Font.Name = sf["font_name"]
-                            if sf["font_size"] is not None:
-                                pr.Font.Size = sf["font_size"]
-                            if sf["bold"] is not None:
-                                pr.Font.Bold = sf["bold"]
-                            if sf["italic"] is not None:
-                                pr.Font.Italic = sf["italic"]
-                            if sf["strikethrough"] is not None:
-                                pr.Font.StrikeThrough = sf["strikethrough"]
-                            pf.Alignment = sf["alignment"]
-                            pf.SpaceBefore = sf["space_before"]
-                            pf.SpaceAfter = sf["space_after"]
-                            pf.LineSpacingRule = sf["line_spacing_rule"]
-                            pf.LineSpacing = sf["line_spacing"]
-                    else:
-                        rng.Style = style_name
-                if paragraph_alignment is not None:
-                    align_map = {"left": 0, "center": 1, "right": 2, "justify": 3}
-                    al = align_map.get(paragraph_alignment.lower())
-                    if al is None:
-                        return json.dumps({"error": f"Invalid alignment: {paragraph_alignment}. Use: left, center, right, justify"})
-                    for para in rng.Paragraphs:
-                        para.Format.Alignment = al
-                if page_break_before is not None:
-                    for para in rng.Paragraphs:
-                        para.Format.PageBreakBefore = page_break_before
-            finally:
-                if track_changes:
-                    doc.TrackRevisions = prev_tracking
-                    app.UserName = prev_author
+            if bold is not None:
+                rng.Font.Bold = bold
+            if italic is not None:
+                rng.Font.Italic = italic
+            if underline is not None:
+                rng.Font.Underline = 1 if underline else 0
+            if strikethrough is not None:
+                rng.Font.StrikeThrough = strikethrough
+            if font_name is not None:
+                rng.Font.Name = font_name
+            if font_size is not None:
+                rng.Font.Size = font_size
+            if font_color is not None:
+                c = font_color.lstrip("#")
+                r, g, b = int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+                rng.Font.Color = r + (g << 8) + (b << 16)
+            if highlight_color is not None:
+                rng.HighlightColorIndex = highlight_color
+            if style_name is not None:
+                if preserve_direct_formatting:
+                    # Apply style per-paragraph and restore formatting
+                    for sf in saved_formats:
+                        p = sf["para"]
+                        p.Style = doc.Styles(style_name)
+                        pr = p.Range
+                        pf = p.Format
+                        if sf["font_name"] is not None:
+                            pr.Font.Name = sf["font_name"]
+                        if sf["font_size"] is not None:
+                            pr.Font.Size = sf["font_size"]
+                        if sf["bold"] is not None:
+                            pr.Font.Bold = sf["bold"]
+                        if sf["italic"] is not None:
+                            pr.Font.Italic = sf["italic"]
+                        if sf["strikethrough"] is not None:
+                            pr.Font.StrikeThrough = sf["strikethrough"]
+                        pf.Alignment = sf["alignment"]
+                        pf.SpaceBefore = sf["space_before"]
+                        pf.SpaceAfter = sf["space_after"]
+                        pf.LineSpacingRule = sf["line_spacing_rule"]
+                        pf.LineSpacing = sf["line_spacing"]
+                else:
+                    rng.Style = style_name
+            if paragraph_alignment is not None:
+                align_map = {"left": 0, "center": 1, "right": 2, "justify": 3}
+                al = align_map.get(paragraph_alignment.lower())
+                if al is None:
+                    return json.dumps({"error": f"Invalid alignment: {paragraph_alignment}. Use: left, center, right, justify"})
+                for para in rng.Paragraphs:
+                    para.Format.Alignment = al
+            if page_break_before is not None:
+                for para in rng.Paragraphs:
+                    para.Format.PageBreakBefore = page_break_before
 
         preview = rng.Text
         if len(preview) > 50:
@@ -407,6 +401,7 @@ async def word_live_apply_list(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         total_paras = doc.Paragraphs.Count
         if start_paragraph < 1 or end_paragraph > total_paras:
@@ -414,89 +409,78 @@ async def word_live_apply_list(
                 "error": f"Paragraph range {start_paragraph}-{end_paragraph} out of bounds (doc has {total_paras} paragraphs)"
             })
 
-        with undo_record(app, "MCP: Apply List"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
+        with edit_session(app, doc, 'MCP: Apply List', track_changes):
+            formatted = 0
 
-            try:
-                formatted = 0
-
-                if remove:
-                    for i in range(start_paragraph, end_paragraph + 1):
-                        doc.Paragraphs(i).Range.ListFormat.RemoveNumbers()
-                        formatted += 1
-                elif list_type == "multilevel":
-                    # Create custom multilevel list template (OutlineNumbered gallery)
-                    lt = doc.ListTemplates.Add(OutlineNumbered=True)
-                    # Normalize dict keys to int (JSON sends string keys)
-                    nf = {int(k): v for k, v in (number_format or {1: "%1.", 2: "%1.%2."}).items()}
-                    sa = {int(k): v for k, v in (start_at or {}).items()}
-                    lm = {int(k): int(v) for k, v in (level_map or {}).items()}
-                    # Map number_style string to wdListNumberStyle constant
-                    style_map = {
-                        "arabic": 0, "lowercase_letter": 4, "uppercase_letter": 3,
-                        "lowercase_roman": 2, "uppercase_roman": 1,
-                    }
-                    # number_style can be a string (same for all) or dict (per-level)
-                    if isinstance(number_style, dict):
-                        ns_map = {int(k): style_map.get(v, 0) for k, v in number_style.items()}
-                    elif isinstance(number_style, str):
-                        ns_map = {lvl: style_map.get(number_style, 0) for lvl in nf}
-                    else:
-                        ns_map = {}
-                    for lvl_num, fmt_str in nf.items():
-                        lv = lt.ListLevels(int(lvl_num))
-                        lv.NumberFormat = fmt_str
-                        lv.NumberStyle = ns_map.get(int(lvl_num), 0)
-                        lv.StartAt = sa.get(int(lvl_num), 1)
-                        lv.Alignment = 0  # left
-                        lv.NumberPosition = 0
-                        lv.TextPosition = 28
-                        lv.TabPosition = 28
-                        # Do NOT set LinkedStyle — avoids Heading style side effects
-
-                    # Apply template to the full range at once (not per-paragraph)
-                    rng = doc.Range(
-                        doc.Paragraphs(start_paragraph).Range.Start,
-                        doc.Paragraphs(end_paragraph).Range.End,
-                    )
-                    rng.ListFormat.ApplyListTemplateWithLevel(
-                        ListTemplate=lt,
-                        ContinuePreviousList=continue_previous,
-                        ApplyTo=2,  # wdListApplyToSelection
-                        DefaultListBehavior=0,
-                    )
-                    formatted = end_paragraph - start_paragraph + 1
-
-                    # Set per-paragraph levels from level_map
-                    default_lvl = level + 1 if level > 0 else 1
-                    for i in range(start_paragraph, end_paragraph + 1):
-                        target_lvl = lm.get(i, default_lvl)
-                        if target_lvl != 1:
-                            doc.Paragraphs(i).Range.ListFormat.ListLevelNumber = target_lvl
+            if remove:
+                for i in range(start_paragraph, end_paragraph + 1):
+                    doc.Paragraphs(i).Range.ListFormat.RemoveNumbers()
+                    formatted += 1
+            elif list_type == "multilevel":
+                # Create custom multilevel list template (OutlineNumbered gallery)
+                lt = doc.ListTemplates.Add(OutlineNumbered=True)
+                # Normalize dict keys to int (JSON sends string keys)
+                nf = {int(k): v for k, v in (number_format or {1: "%1.", 2: "%1.%2."}).items()}
+                sa = {int(k): v for k, v in (start_at or {}).items()}
+                lm = {int(k): int(v) for k, v in (level_map or {}).items()}
+                # Map number_style string to wdListNumberStyle constant
+                style_map = {
+                    "arabic": 0, "lowercase_letter": 4, "uppercase_letter": 3,
+                    "lowercase_roman": 2, "uppercase_roman": 1,
+                }
+                # number_style can be a string (same for all) or dict (per-level)
+                if isinstance(number_style, dict):
+                    ns_map = {int(k): style_map.get(v, 0) for k, v in number_style.items()}
+                elif isinstance(number_style, str):
+                    ns_map = {lvl: style_map.get(number_style, 0) for lvl in nf}
                 else:
-                    # bullet or number (original logic)
-                    gallery_map = {"bullet": 1, "number": 2}
-                    gallery_idx = gallery_map.get(list_type, 1)
-                    template = doc.Application.ListGalleries(gallery_idx).ListTemplates(1)
-                    for i in range(start_paragraph, end_paragraph + 1):
-                        para = doc.Paragraphs(i)
-                        should_continue = (i > start_paragraph) or continue_previous
-                        para.Range.ListFormat.ApplyListTemplateWithLevel(
-                            ListTemplate=template,
-                            ContinuePreviousList=should_continue,
-                            DefaultListBehavior=1,
-                        )
-                        if level > 0:
-                            para.Range.ListFormat.ListLevelNumber = level + 1
-                        formatted += 1
-            finally:
-                if track_changes:
-                    doc.TrackRevisions = prev_tracking
-                    app.UserName = prev_author
+                    ns_map = {}
+                for lvl_num, fmt_str in nf.items():
+                    lv = lt.ListLevels(int(lvl_num))
+                    lv.NumberFormat = fmt_str
+                    lv.NumberStyle = ns_map.get(int(lvl_num), 0)
+                    lv.StartAt = sa.get(int(lvl_num), 1)
+                    lv.Alignment = 0  # left
+                    lv.NumberPosition = 0
+                    lv.TextPosition = 28
+                    lv.TabPosition = 28
+                    # Do NOT set LinkedStyle — avoids Heading style side effects
+
+                # Apply template to the full range at once (not per-paragraph)
+                rng = doc.Range(
+                    doc.Paragraphs(start_paragraph).Range.Start,
+                    doc.Paragraphs(end_paragraph).Range.End,
+                )
+                rng.ListFormat.ApplyListTemplateWithLevel(
+                    ListTemplate=lt,
+                    ContinuePreviousList=continue_previous,
+                    ApplyTo=2,  # wdListApplyToSelection
+                    DefaultListBehavior=0,
+                )
+                formatted = end_paragraph - start_paragraph + 1
+
+                # Set per-paragraph levels from level_map
+                default_lvl = level + 1 if level > 0 else 1
+                for i in range(start_paragraph, end_paragraph + 1):
+                    target_lvl = lm.get(i, default_lvl)
+                    if target_lvl != 1:
+                        doc.Paragraphs(i).Range.ListFormat.ListLevelNumber = target_lvl
+            else:
+                # bullet or number (original logic)
+                gallery_map = {"bullet": 1, "number": 2}
+                gallery_idx = gallery_map.get(list_type, 1)
+                template = doc.Application.ListGalleries(gallery_idx).ListTemplates(1)
+                for i in range(start_paragraph, end_paragraph + 1):
+                    para = doc.Paragraphs(i)
+                    should_continue = (i > start_paragraph) or continue_previous
+                    para.Range.ListFormat.ApplyListTemplateWithLevel(
+                        ListTemplate=template,
+                        ContinuePreviousList=should_continue,
+                        DefaultListBehavior=1,
+                    )
+                    if level > 0:
+                        para.Range.ListFormat.ListLevelNumber = level + 1
+                    formatted += 1
 
         action = "removed" if remove else f"applied {list_type}"
         return json.dumps({
@@ -533,7 +517,7 @@ async def word_live_setup_heading_numbering(
     h2_space_after: float = None,
     line_spacing: float = None,
 ) -> str:
-    """[Windows only] Set up auto-numbered headings with multilevel list (1. / 1.1).
+    r"""[Windows only] Set up auto-numbered headings with multilevel list (1. / 1.1).
 
     Creates a multilevel list template linked to Heading 1 and Heading 2 styles.
     Default formats: Level 1 = "%1." (produces "1."), Level 2 = "%1.%2" (produces "1.1").
@@ -608,6 +592,7 @@ async def word_live_setup_heading_numbering(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         def _find_para_text(doc, text):
             """Find paragraph text in doc body, return range or None."""
@@ -971,76 +956,58 @@ async def word_live_replace_text(
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    if replace_all and track_changes:
-        return json.dumps({
-            "error": "replace_all=True with track_changes=True causes an infinite loop "
-            "(tracked deletions stay visible to Find, triggering endless re-replacement). "
-            "Use replace_all=False — each unique text only needs one replacement."
-        })
-
     try:
-        from word_document_server.core.word_com import get_word_app, find_document, undo_record
-
+        from word_document_server.core.word_com import get_word_app, find_document
         app = get_word_app()
         doc = find_document(app, filename)
-
-        with undo_record(app, "MCP: Replace Text"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
-            elif replace_all and prev_tracking:
-                # Issue #7: document has TrackRevisions on but caller wants
-                # untracked replace_all — disable temporarily to prevent
-                # infinite loop (tracked deletions stay visible to Find).
-                doc.TrackRevisions = False
-
-            try:
-                count = 0
-                MAX_REPLACEMENTS = 50_000  # safety ceiling
-                rng = doc.Content.Duplicate
-                rng.Find.ClearFormatting()
-
-                while True:
-                    found = rng.Find.Execute(
-                        FindText=find_text,
-                        MatchCase=match_case,
-                        MatchWholeWord=match_whole_word if not use_wildcards else False,
-                        MatchWildcards=use_wildcards,
-                        Forward=True,
-                        Wrap=0,  # wdFindStop
-                    )
-                    if not found:
-                        break
-                    # Guard: zero-length match → skip forward 1 char to avoid infinite loop
-                    if rng.Start == rng.End:
-                        rng.Start = rng.Start + 1
-                        rng.End = doc.Content.End
-                        continue
-                    # Convert Word special characters to actual characters for rng.Text assignment
-                    # (rng.Text doesn't interpret ^p/^t/^m like Find.Execute Replace does)
-                    processed = replace_text.replace("^p", "\r").replace("^t", "\t").replace("^m", "\x0c").replace("^s", "\u00a0")
-                    rng.Text = processed
-                    count += 1
-                    if not replace_all:
-                        break
-                    if count >= MAX_REPLACEMENTS:
-                        break
-                    rng.Collapse(0)  # wdCollapseEnd — move past replacement
-            finally:
-                doc.TrackRevisions = prev_tracking
-                if track_changes:
-                    app.UserName = prev_author
+        app = doc.Application
+        count, search_start, complete = 0, 0, True
+        tracked = bool(track_changes or doc.TrackRevisions)
+        processed = replace_text.replace("^p", "\r").replace("^t", "\t").replace("^m", "\x0c").replace("^s", "\u00a0")
+        matches = []
+        # Find before any edit; replay from right to left. Word may keep a
+        # tracked deleted range at its original End, so searching after each
+        # mutation can revisit that same deletion indefinitely.
+        while search_start < doc.Content.End - 1:
+            rng = doc.Range(search_start, doc.Content.End - 1)
+            rng.Find.ClearFormatting()
+            found = rng.Find.Execute(
+                FindText=find_text, MatchCase=match_case,
+                MatchWholeWord=match_whole_word if not use_wildcards else False,
+                MatchWildcards=use_wildcards, Forward=True, Wrap=0, Format=False,
+            )
+            if not found:
+                break
+            if rng.Start == rng.End:
+                search_start = rng.End + 1
+                continue
+            search_start = rng.End
+            if "\x07" in (rng.Text or ""):
+                raise ValueError('Match spans table cell terminators; no replacements made')
+            # Ignore matches wholly inside deletions already tracked by Word.
+            if any(rev.Type == 2 and rev.Range.Start <= rng.Start and rev.Range.End >= rng.End
+                   for rev in rng.Revisions):
+                continue
+            matches.append(rng.Duplicate)
+            if not replace_all:
+                break
+            if len(matches) >= 50_000:
+                raise ValueError('Safety ceiling reached; narrow the search. No replacements made.')
+        with edit_session(app, doc, "MCP: Replace Text", track_changes):
+            for rng in reversed(matches):
+                rng.Text = processed
+                count += 1
 
         return json.dumps({
-            "success": True,
+            "success": complete,
+            "complete": complete,
+            "note": None if complete else "Safety ceiling reached; partial replacements. Undo to restore this call.",
             "document": doc.Name,
             "find_text": find_text,
             "replace_text": replace_text,
             "replacements": count,
             "replace_all": replace_all,
-            "tracked": track_changes,
+            "tracked": tracked,
         }, ensure_ascii=False)
 
     except Exception as e:
@@ -1088,6 +1055,15 @@ async def word_live_insert_paragraphs(
     if target_text is not None and target_paragraph_index is not None:
         return json.dumps({"error": "Provide target_text or target_paragraph_index, not both"})
 
+    from word_document_server.utils.text_safety import reject_control_chars
+    try:
+        for paragraph in paragraphs:
+            if not isinstance(paragraph, str):
+                raise ValueError('Every paragraph must be a string')
+            reject_control_chars('paragraph', paragraph)
+    except ValueError as error:
+        return json.dumps({'error': str(error)})
+
     if position not in ("before", "after"):
         return json.dumps({"error": f"position must be 'before' or 'after', got '{position}'"})
 
@@ -1096,6 +1072,7 @@ async def word_live_insert_paragraphs(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # Find the target paragraph
         total_paras = doc.Paragraphs.Count
@@ -1121,45 +1098,34 @@ async def word_live_insert_paragraphs(
 
         resolved_style = style if style else "Normal"
 
-        with undo_record(app, "MCP: Insert Paragraphs"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
+        with edit_session(app, doc, 'MCP: Insert Paragraphs', track_changes):
+            inserted = 0
 
-            try:
-                inserted = 0
-
-                if position == "after":
-                    rng = target_para.Range.Duplicate
+            if position == "after":
+                rng = target_para.Range.Duplicate
+                rng.Collapse(0)  # wdCollapseEnd
+                for para_text in paragraphs:
+                    rng.InsertParagraphAfter()
                     rng.Collapse(0)  # wdCollapseEnd
-                    for para_text in paragraphs:
-                        rng.InsertParagraphAfter()
-                        rng.Collapse(0)  # wdCollapseEnd
-                        rng.InsertAfter(para_text)
-                        try:
-                            rng.Style = resolved_style
-                        except Exception:
-                            pass
-                        rng.Collapse(0)  # wdCollapseEnd
-                        inserted += 1
-                else:  # "before"
-                    for para_text in reversed(paragraphs):
-                        rng = target_para.Range.Duplicate
-                        rng.Collapse(1)  # wdCollapseStart
-                        rng.InsertParagraphBefore()
-                        rng.Collapse(1)  # wdCollapseStart
-                        rng.InsertAfter(para_text)
-                        try:
-                            rng.Style = resolved_style
-                        except Exception:
-                            pass
-                        inserted += 1
-            finally:
-                doc.TrackRevisions = prev_tracking
-                if track_changes:
-                    app.UserName = prev_author
+                    rng.InsertAfter(para_text)
+                    try:
+                        rng.Style = resolved_style
+                    except Exception:
+                        pass
+                    rng.Collapse(0)  # wdCollapseEnd
+                    inserted += 1
+            else:  # "before"
+                for para_text in reversed(paragraphs):
+                    rng = target_para.Range.Duplicate
+                    rng.Collapse(1)  # wdCollapseStart
+                    rng.InsertParagraphBefore()
+                    rng.Collapse(1)  # wdCollapseStart
+                    rng.InsertAfter(para_text)
+                    try:
+                        rng.Style = resolved_style
+                    except Exception:
+                        pass
+                    inserted += 1
 
         return json.dumps({
             "success": True,
@@ -1213,7 +1179,22 @@ async def word_live_add_table(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
+        if not 1 <= rows <= 32767 or not 1 <= cols <= 63:
+            raise ValueError('Invalid table dimensions')
+        if data is not None:
+            if not isinstance(data, list) or len(data) > rows or any(not isinstance(x,list) or len(x)>cols for x in data):
+                raise ValueError('data must fit the requested table dimensions')
+            from word_document_server.utils.text_safety import reject_control_chars
+            for row_data in data:
+                for value in row_data:
+                    if value is not None:
+                        reject_control_chars('cell text', str(value))
+        if autofit and autofit.lower() not in ('window','content','fixed'):
+            raise ValueError('Invalid autofit mode')
+        if style:
+            doc.Styles(style)
         if position == "start":
             rng = doc.Range(0, 0)
         elif position == "end":
@@ -1264,46 +1245,29 @@ async def word_live_add_table(
 
             rng = doc.Range(offset, offset)
 
-        with undo_record(app, "MCP: Add Table"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
+        with edit_session(app, doc, 'MCP: Add Table', track_changes):
+            AUTOFIT_MAP = {
+                "window": (1, 2),   # wdWord9TableBehavior, wdAutoFitWindow
+                "content": (1, 1),  # wdWord9TableBehavior, wdAutoFitContent
+                "fixed": (0, 0),    # wdWord8TableBehavior, wdAutoFitFixed
+            }
 
-            try:
-                # AutoFit behavior constants
-                AUTOFIT_MAP = {
-                    "window": (1, 2),   # wdWord9TableBehavior, wdAutoFitWindow
-                    "content": (1, 1),  # wdWord9TableBehavior, wdAutoFitContent
-                    "fixed": (0, 0),    # wdWord8TableBehavior, wdAutoFitFixed
-                }
+            if autofit and autofit.lower() in AUTOFIT_MAP:
+                default_behavior, autofit_behavior = AUTOFIT_MAP[autofit.lower()]
+                table = doc.Tables.Add(rng, rows, cols, default_behavior, autofit_behavior)
+            else:
+                table = doc.Tables.Add(rng, rows, cols)
 
-                if autofit and autofit.lower() in AUTOFIT_MAP:
-                    default_behavior, autofit_behavior = AUTOFIT_MAP[autofit.lower()]
-                    table = doc.Tables.Add(rng, rows, cols, default_behavior, autofit_behavior)
-                else:
-                    table = doc.Tables.Add(rng, rows, cols)
+            # Apply table style
+            if style:
+                try:
+                    table.Style = doc.Styles(style)
+                except Exception:
+                    pass  # Style not found; proceed without
 
-                # Apply table style
-                if style:
-                    try:
-                        table.Style = doc.Styles(style)
-                    except Exception:
-                        pass  # Style not found; proceed without
-
-                if data:
-                    for r_idx, row_data in enumerate(data):
-                        if r_idx >= rows:
-                            break
-                        for c_idx, cell_val in enumerate(row_data):
-                            if c_idx >= cols:
-                                break
-                            table.Cell(r_idx + 1, c_idx + 1).Range.Text = str(cell_val)
-            finally:
-                if track_changes:
-                    doc.TrackRevisions = prev_tracking
-                    app.UserName = prev_author
+            if data:
+                from word_document_server.core.table_com import set_range
+                set_range(table, data)
 
         return json.dumps(
             {
@@ -1369,6 +1333,7 @@ async def word_live_format_table(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if doc.Tables.Count == 0:
             return json.dumps({"error": "Document has no tables"})
@@ -1536,31 +1501,24 @@ async def word_live_delete_text(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
+        if not 0 <= start <= end <= doc.Content.End - 1:
+            raise ValueError("Invalid deletion range; final document mark is protected")
         rng = doc.Range(start, end)
         deleted_text = rng.Text
 
-        with undo_record(app, "MCP: Delete Text"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
-
-            try:
-                # Delete any table objects within the range first
-                # (rng.Delete only removes text, leaving ghost table structure)
-                for i in range(doc.Tables.Count, 0, -1):
-                    tbl = doc.Tables(i)
-                    if tbl.Range.Start >= start and tbl.Range.End <= end:
-                        tbl.Delete()
-                # Delete remaining text in the range
-                rng = doc.Range(start, min(end, doc.Content.End))
-                if rng.Start < rng.End:
-                    rng.Delete()
-            finally:
-                if track_changes:
-                    doc.TrackRevisions = prev_tracking
-                    app.UserName = prev_author
+        with edit_session(app, doc, 'MCP: Delete Text', track_changes):
+            adjusted_end = end
+            for i in range(doc.Tables.Count, 0, -1):
+                tbl = doc.Tables(i)
+                if tbl.Range.Start >= start and tbl.Range.End <= end:
+                    before_end = doc.Content.End
+                    tbl.Delete()
+                    adjusted_end -= before_end - doc.Content.End
+            # Delete remaining text in the range
+            rng = doc.Range(start, min(adjusted_end, doc.Content.End - 1))
+            if rng.Start < rng.End:
+                rng.Delete()
 
         preview = deleted_text
         if len(preview) > 100:
@@ -1646,6 +1604,7 @@ async def word_live_modify_table(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # Per-call validation: re-read Tables.Count fresh in case a prior
         # MCP call (especially delete_table) reduced or zeroed the count.
@@ -1680,70 +1639,59 @@ async def word_live_modify_table(
             return json.dumps(result, ensure_ascii=False)
 
         # All other operations are destructive
-        with undo_record(app, "MCP: Modify Table"):
-            prev_tracking = doc.TrackRevisions
-            prev_author = app.UserName
-            if track_changes:
-                doc.TrackRevisions = True
-                app.UserName = DEFAULT_AUTHOR
+        with edit_session(app, doc, 'MCP: Modify Table', track_changes):
+            if op == "set_cell":
+                if row is None or col is None or text is None:
+                    return json.dumps({"error": "set_cell requires row, col, and text"})
+                result = table_com.set_cell(table, row, col, text, accept_revisions=accept_revisions)
 
-            try:
-                if op == "set_cell":
-                    if row is None or col is None or text is None:
-                        return json.dumps({"error": "set_cell requires row, col, and text"})
-                    result = table_com.set_cell(table, row, col, text, accept_revisions=accept_revisions)
+            elif op == "set_row":
+                if row is None or not cells:
+                    return json.dumps({"error": "set_row requires row and cells (list of values)"})
+                result = table_com.set_row(table, row, cells, accept_revisions=accept_revisions)
 
-                elif op == "set_row":
-                    if row is None or not cells:
-                        return json.dumps({"error": "set_row requires row and cells (list of values)"})
-                    result = table_com.set_row(table, row, cells, accept_revisions=accept_revisions)
+            elif op == "set_range":
+                if not cells:
+                    return json.dumps({"error": "set_range requires cells (2D list of values)"})
+                result = table_com.set_range(
+                    table, cells,
+                    start_row=start_row or 1,
+                    start_col=start_col or 1,
+                    accept_revisions=accept_revisions,
+                )
 
-                elif op == "set_range":
-                    if not cells:
-                        return json.dumps({"error": "set_range requires cells (2D list of values)"})
-                    result = table_com.set_range(
-                        table, cells,
-                        start_row=start_row or 1,
-                        start_col=start_col or 1,
-                        accept_revisions=accept_revisions,
-                    )
+            elif op == "add_column":
+                result = table_com.add_column(table, before_col, header, cells)
 
-                elif op == "add_column":
-                    result = table_com.add_column(table, before_col, header, cells)
+            elif op == "delete_column":
+                if col is None:
+                    return json.dumps({"error": "delete_column requires col"})
+                result = table_com.delete_column(table, col)
 
-                elif op == "delete_column":
-                    if col is None:
-                        return json.dumps({"error": "delete_column requires col"})
-                    result = table_com.delete_column(table, col)
+            elif op == "add_row":
+                result = table_com.add_row(table, before_row, cells)
 
-                elif op == "add_row":
-                    result = table_com.add_row(table, before_row, cells)
+            elif op == "delete_row":
+                if row is None:
+                    return json.dumps({"error": "delete_row requires row"})
+                result = table_com.delete_row(table, row)
 
-                elif op == "delete_row":
-                    if row is None:
-                        return json.dumps({"error": "delete_row requires row"})
-                    result = table_com.delete_row(table, row)
+            elif op == "merge_cells":
+                if not all(v is not None for v in [start_row, start_col, end_row, end_col]):
+                    return json.dumps({"error": "merge_cells requires start_row, start_col, end_row, end_col"})
+                result = table_com.merge_cells(table, start_row, start_col, end_row, end_col)
 
-                elif op == "merge_cells":
-                    if not all(v is not None for v in [start_row, start_col, end_row, end_col]):
-                        return json.dumps({"error": "merge_cells requires start_row, start_col, end_row, end_col"})
-                    result = table_com.merge_cells(table, start_row, start_col, end_row, end_col)
+            elif op == "autofit":
+                result = table_com.autofit(table, autofit_mode)
 
-                elif op == "autofit":
-                    result = table_com.autofit(table, autofit_mode)
+            elif op == "delete_table":
+                result = table_com.delete_table(table, scrub_orphans=scrub_orphans)
 
-                elif op == "delete_table":
-                    result = table_com.delete_table(table, scrub_orphans=scrub_orphans)
-
-                else:
-                    return json.dumps({
-                        "error": f"Unknown operation '{op}'. Use: get_info, set_cell, set_row, set_range, "
-                        "add_column, delete_column, add_row, delete_row, merge_cells, autofit, delete_table"
-                    })
-            finally:
-                if track_changes:
-                    doc.TrackRevisions = prev_tracking
-                    app.UserName = prev_author
+            else:
+                return json.dumps({
+                    "error": f"Unknown operation '{op}'. Use: get_info, set_cell, set_row, set_range, "
+                    "add_column, delete_column, add_row, delete_row, merge_cells, autofit, delete_table"
+                })
 
         result["success"] = True
         result["document"] = doc.Name
@@ -1788,6 +1736,7 @@ async def word_live_undo(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         result = doc.Undo(times)
 
@@ -1829,6 +1778,7 @@ async def word_live_save(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if save_as:
             save_path = os.path.abspath(save_as)
@@ -1841,8 +1791,16 @@ async def word_live_save(
                 ".rtf": 6,    # wdFormatRTF
                 ".txt": 2,    # wdFormatText
             }
-            file_format = format_map.get(ext, 16)
-            doc.SaveAs2(save_path, FileFormat=file_format)
+            if ext not in format_map:
+                raise ValueError(f'Unsupported save extension: {ext}')
+            file_format = format_map[ext]
+            if ext == '.pdf':
+                from word_document_server.core.pdf_export import export_open_document
+                export_open_document(doc, save_path)
+            else:
+                from word_document_server.utils.save_utils import backup_existing
+                backup_existing(save_path)
+                doc.SaveAs2(save_path, FileFormat=file_format)
             return json.dumps({
                 "success": True,
                 "document": doc.Name,
@@ -1850,6 +1808,10 @@ async def word_live_save(
                 "format": ext,
             }, ensure_ascii=False)
         else:
+            if not doc.Path:
+                raise ValueError('Unsaved document: supply save_as to avoid an interactive Save dialog')
+            from word_document_server.utils.save_utils import backup_existing
+            backup_existing(doc.FullName)
             doc.Save()
             return json.dumps({
                 "success": True,
@@ -1888,6 +1850,7 @@ async def word_live_toggle_track_changes(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         previous = bool(doc.TrackRevisions)
         if enable is None:
@@ -1966,6 +1929,7 @@ async def word_live_insert_image(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # Determine insertion range
         if paragraph_index is not None:
@@ -1985,8 +1949,7 @@ async def word_live_insert_image(
                 offset = int(position)
                 rng = doc.Range(offset, offset)
             except (ValueError, TypeError):
-                rng = doc.Range()
-                rng.Collapse(0)
+                raise ValueError("Invalid insert_position; use start, end or a character offset")
 
         # Resolve final size in points (pt params override inches params)
         final_w = None
@@ -2184,19 +2147,19 @@ async def word_live_insert_cross_reference(
         "bookmark": 2,       # wdRefTypeBookmark
         "footnote": 3,       # wdRefTypeFootnote
         "endnote": 4,        # wdRefTypeEndnote
-        "figure": 10,        # wdRefTypeFigure (SEQ Figure)
-        "table": 11,         # wdRefTypeTable (SEQ Table)
-        "equation": 12,      # wdRefTypeEquation
+        "figure": -1,        # wdRefTypeFigure (SEQ Figure)
+        "table": -2,         # wdRefTypeTable (SEQ Table)
+        "equation": -3,      # wdRefTypeEquation
     }
 
     # Map ref_kind to Word constants (wdReferenceKind)
     ref_kind_map = {
-        "text": 0,                 # wdContentText
-        "number": 1,               # wdNumberFullContext
-        "number_no_context": 2,    # wdNumberNoContext
-        "number_relative": 3,      # wdNumberRelativeContext
+        "text": -1,                # wdContentText
+        "number": -4,              # wdNumberFullContext
+        "number_no_context": -3,   # wdNumberNoContext
+        "number_relative": -2,     # wdNumberRelativeContext
         "page": 7,                 # wdPageNumber
-        "above_below": 6,          # wdAboveBelow
+        "above_below": 15,         # wdPosition
     }
 
     ref_type_lower = ref_type.lower()
@@ -2216,8 +2179,25 @@ async def word_live_insert_cross_reference(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
-        # Move selection to insertion point
+        # Use documented Word enums; caption reference kinds differ from headings.
+        reference_kind = ref_kind_map[ref_kind_lower]
+        if ref_type_lower in ('figure', 'table', 'equation'):
+            caption_kinds = {'text': 2, 'number': 3, 'number_no_context': 3,
+                             'page': 7, 'above_below': 15}
+            if ref_kind_lower not in caption_kinds:
+                raise ValueError('Unsupported reference kind for a caption')
+            reference_kind = caption_kinds[ref_kind_lower]
+        # Resolve the insertion range without moving the active selection.
+        if not isinstance(ref_item, int) or ref_item < 1:
+            raise ValueError('ref_item must be a positive item index')
+        reference_item = str(ref_item)
+        if ref_type_lower == 'bookmark':
+            items = doc.GetCrossReferenceItems(ref_type_map[ref_type_lower])
+            if ref_item > len(items):
+                raise ValueError('Bookmark reference index out of range')
+            reference_item = str(items[ref_item - 1])
         if paragraph_index is not None:
             if paragraph_index < 1 or paragraph_index > doc.Paragraphs.Count:
                 return json.dumps({
@@ -2228,23 +2208,19 @@ async def word_live_insert_cross_reference(
         elif insert_position == "start":
             rng = doc.Range(0, 0)
         elif insert_position == "end":
-            rng = doc.Range()
-            rng.Collapse(0)  # wdCollapseEnd
+            rng = doc.Range(doc.Content.End - 1, doc.Content.End - 1)
         else:
             try:
                 offset = int(insert_position)
                 rng = doc.Range(offset, offset)
             except (ValueError, TypeError):
-                rng = doc.Range()
-                rng.Collapse(0)
-
-        rng.Select()
+                raise ValueError("Invalid insert_position; use start, end or a character offset")
 
         with undo_record(app, "MCP: Insert Cross Reference"):
-            app.Selection.InsertCrossReference(
+            rng.InsertCrossReference(
                 ReferenceType=ref_type_map[ref_type_lower],
-                ReferenceKind=ref_kind_map[ref_kind_lower],
-                ReferenceItem=ref_item,
+                ReferenceKind=reference_kind,
+                ReferenceItem=reference_item,
                 InsertAsHyperlink=insert_as_hyperlink,
             )
 
@@ -2296,6 +2272,7 @@ async def word_live_list_cross_reference_items(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         result = []
 
@@ -2316,14 +2293,13 @@ async def word_live_list_cross_reference_items(
                         idx += 1
 
         elif ref_type_lower == "bookmark":
-            for i in range(1, doc.Bookmarks.Count + 1):
-                bm = doc.Bookmarks(i)
-                text = bm.Range.Text.strip()[:100] if bm.Range else ""
-                result.append({
-                    "index": i,
-                    "name": bm.Name,
-                    "text": text,
-                })
+            # Match Word's Cross-reference dialog ordering, not the collection
+            # ordering (which can include hidden automatic bookmarks).
+            names = doc.GetCrossReferenceItems(2)
+            for i, name in enumerate(names, 1):
+                bm = doc.Bookmarks(str(name))
+                result.append({"index": i, "name": str(name),
+                               "text": bm.Range.Text.strip()[:100]})
 
         elif ref_type_lower == "footnote":
             for i in range(1, doc.Footnotes.Count + 1):
@@ -2344,19 +2320,10 @@ async def word_live_list_cross_reference_items(
                 })
 
         elif ref_type_lower in ("figure", "table", "equation"):
-            # Scan for captioned items (SEQ fields)
-            seq_label = {"figure": "Figure", "table": "Table", "equation": "Equation"}[ref_type_lower]
-            idx = 1
-            for i in range(1, doc.Paragraphs.Count + 1):
-                p = doc.Paragraphs(i)
-                text = p.Range.Text.strip()
-                if text.startswith(seq_label):
-                    result.append({
-                        "index": idx,
-                        "text": text[:100],
-                        "paragraph": i,
-                    })
-                    idx += 1
+            # Native label IDs also work in non-English Word installations.
+            label = {"figure": -1, "table": -2, "equation": -3}[ref_type_lower]
+            result = [{"index": i, "text": str(text)[:100]}
+                      for i, text in enumerate(doc.GetCrossReferenceItems(label), 1)]
 
         return json.dumps({
             "success": True,
@@ -2485,6 +2452,7 @@ async def word_live_insert_equation(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if not equation or not equation.strip():
             return json.dumps({"error": "equation text is required"})

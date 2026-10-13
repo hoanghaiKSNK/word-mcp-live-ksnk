@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "word-mcp-live"
-version = "1.6.21"
+version = "1.6.21+ksnk.1"
 description = "MCP server for Microsoft Word — live editing on Windows (COM) and macOS (JXA), plus cross-platform python-docx tools"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -30,10 +30,10 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/ykarapazar/word-mcp-live"
-"Bug Tracker" = "https://github.com/ykarapazar/word-mcp-live/issues"
-"Changelog" = "https://github.com/ykarapazar/word-mcp-live/blob/main/CHANGELOG.md"
-"Documentation" = "https://github.com/ykarapazar/word-mcp-live#readme"
+"Homepage" = "https://github.com/hoanghaiKSNK/word-mcp-live-ksnk"
+"Bug Tracker" = "https://github.com/hoanghaiKSNK/word-mcp-live-ksnk/issues"
+"Changelog" = "https://github.com/hoanghaiKSNK/word-mcp-live-ksnk/blob/main/CHANGELOG.md"
+"Documentation" = "https://github.com/hoanghaiKSNK/word-mcp-live-ksnk#readme"
 
 [tool.hatch.build.targets.wheel]
 only-include = [

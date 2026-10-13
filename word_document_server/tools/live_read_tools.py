@@ -25,14 +25,16 @@ _paragraph_snapshots: dict[str, dict] = {}
 
 def _doc_key(doc) -> str:
     """Return a stable, case-insensitive key for an open COM document."""
-    return doc.Name.lower()
+    from word_document_server.core.word_com import normalize_document_path
+    return normalize_document_path(doc.FullName)
 
 
 def _read_paragraphs(doc) -> list[dict]:
     """Read all paragraphs from *doc* and return as a list of dicts."""
     paras = []
-    for i in range(1, doc.Paragraphs.Count + 1):
-        text = doc.Paragraphs(i).Range.Text.rstrip("\r\x07")
+    collection = doc.Paragraphs
+    for i, para in enumerate(collection, 1):
+        text = para.Range.Text.rstrip("\r\x07")
         paras.append({"index": i, "text": text})
     return paras
 
@@ -84,6 +86,7 @@ async def word_live_take_snapshot(filename: str = None) -> str:
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
         paras = _read_paragraphs(doc)
         _store_snapshot(doc, paras)
         snap = _get_snapshot(doc)
@@ -124,6 +127,7 @@ async def word_live_get_diff(filename: str = None) -> str:
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         snap = _get_snapshot(doc)
         if snap is None:
@@ -218,6 +222,7 @@ async def word_live_snapshot_status(filename: str = None) -> str:
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
         snap = _get_snapshot(doc)
 
         if snap is None:
@@ -281,6 +286,7 @@ async def word_live_get_text(filename: str = None) -> str:
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         total_paras = doc.Paragraphs.Count
 
@@ -363,6 +369,7 @@ async def word_live_get_paragraph_format(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         total_paras = doc.Paragraphs.Count
         if start_paragraph < 1 or end_paragraph > total_paras:
@@ -486,6 +493,7 @@ async def word_live_get_info(filename: str = None) -> str:
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # wdStatistic constants
         WD_STAT_PAGES = 2
@@ -573,6 +581,7 @@ async def word_live_find_text(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # COM-marshalling can fail intermittently after MCP reconnect on
         # property access (rng.Text, doc.Name). Wrap each access so a
@@ -667,6 +676,7 @@ async def word_live_get_comments(filename: str = None) -> str:
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         comments = []
         for i in range(1, doc.Comments.Count + 1):
@@ -753,6 +763,7 @@ async def word_live_add_comment(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # Determine the range to attach the comment to
         if paragraph_index is not None:
@@ -771,8 +782,8 @@ async def word_live_add_comment(
         with undo_record(app, "MCP: Add Comment"):
             # Save and restore author
             prev_author = app.UserName
-            app.UserName = author
             try:
+                app.UserName = author
                 comment = doc.Comments.Add(rng, text)
             finally:
                 app.UserName = prev_author
@@ -825,6 +836,7 @@ async def word_live_reply_to_comment(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if comment_index < 1 or comment_index > doc.Comments.Count:
             return json.dumps({
@@ -835,8 +847,8 @@ async def word_live_reply_to_comment(
 
         with undo_record(app, "MCP: Reply to Comment"):
             prev_author = app.UserName
-            app.UserName = author
             try:
+                app.UserName = author
                 reply = comment.Replies.Add(comment.Scope, text)
             except AttributeError:
                 return json.dumps({
@@ -890,6 +902,7 @@ async def word_live_resolve_comment(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if comment_index < 1 or comment_index > doc.Comments.Count:
             return json.dumps({
@@ -954,6 +967,7 @@ async def word_live_delete_comment(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         if comment_index < 1 or comment_index > doc.Comments.Count:
             return json.dumps({
@@ -999,6 +1013,7 @@ async def word_live_list_revisions(filename: str = None) -> str:
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # Revision type names
         REV_TYPES = {
@@ -1074,6 +1089,7 @@ async def word_live_accept_revisions(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         with undo_record(app, "MCP: Accept Revisions"):
             if revision_ids is not None:
@@ -1146,6 +1162,7 @@ async def word_live_reject_revisions(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         with undo_record(app, "MCP: Reject Revisions"):
             if revision_ids is not None:
@@ -1227,6 +1244,7 @@ async def word_live_get_page_text(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         # wdStatisticPages = 2
         total_pages = doc.ComputeStatistics(2)
@@ -1256,10 +1274,13 @@ async def word_live_get_page_text(
 
         # Collect paragraphs within the page range
         paragraphs = []
-        for i in range(1, doc.Paragraphs.Count + 1):
-            para = doc.Paragraphs(i)
-            p_start = para.Range.Start
-            p_end = para.Range.End
+        page_paragraphs = doc.Range(range_start, range_end).Paragraphs
+        first_start = page_paragraphs(1).Range.Start
+        first_index = doc.Range(0, first_start).Paragraphs.Count + 1 if first_start else 1
+        for i, para in enumerate(page_paragraphs, first_index):
+            para_range = para.Range
+            p_start = para_range.Start
+            p_end = para_range.End
 
             # Skip paragraphs entirely before our range
             if p_end <= range_start:
@@ -1268,7 +1289,7 @@ async def word_live_get_page_text(
             if p_start >= range_end:
                 break
 
-            text = para.Range.Text.rstrip("\r\x07")
+            text = para_range.Text.rstrip("\r\x07")
             paragraphs.append({
                 "index": i,
                 "text": text,
@@ -1318,6 +1339,7 @@ async def word_live_get_undo_history(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         entries = []
         try:
@@ -1383,6 +1405,7 @@ async def word_live_diagnose_layout(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         issues = []
         style_counts = {}
@@ -1556,6 +1579,7 @@ async def word_live_set_core_properties(
 
         app = get_word_app()
         doc = find_document(app, filename)
+        app = doc.Application
 
         inputs = {
             "title": title, "subject": subject, "author": author,

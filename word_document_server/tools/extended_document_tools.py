@@ -4,6 +4,7 @@ Extended document tools for Word Document Server.
 These tools provide enhanced document content extraction and search capabilities.
 """
 import os
+import asyncio
 import json
 import subprocess
 import platform
@@ -127,11 +128,11 @@ async def convert_to_pdf(filename: str, output_filename: Optional[str] = None) -
             if system == "Windows":
                 # On Windows, try docx2pdf which uses Microsoft Word
                 try:
-                    from docx2pdf import convert
-                    convert(filename, output_filename)
+                    from word_document_server.core.pdf_export import convert_in_private_word
+                    await asyncio.to_thread(convert_in_private_word, filename, output_filename)
                     return f"Document successfully converted to PDF: {output_filename}"
                 except (ImportError, Exception) as e:
-                    return f"Failed to convert document to PDF: {str(e)}\nNote: docx2pdf requires Microsoft Word to be installed."
+                    return f"Failed to convert document to PDF: {str(e)}\nNote: Microsoft Word must be installed."
 
             elif system in ["Linux", "Darwin"]:  # Linux or macOS
                 errors = []
