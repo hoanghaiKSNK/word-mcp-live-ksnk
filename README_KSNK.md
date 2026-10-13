@@ -1,6 +1,6 @@
 # KSNK maintenance fork
 
-Version `1.6.21+ksnk.1`, based on upstream commit `12bbff97873bbce38be2dde52af4a6209a92a381`.
+Version `1.6.21+ksnk.2`, based on upstream commit `12bbff97873bbce38be2dde52af4a6209a92a381`.
 This is a maintenance fork of Word MCP Live, not a Microsoft/OpenAI product.
 Original MIT license and contributor attribution are retained. No paid model API
 or additional AI subscription is used by this MCP server.
@@ -40,10 +40,49 @@ prevents edits from starting; cancellation cannot safely interrupt a COM call
 already running. Do not blindly retry an edit after a timeout: read the document
 and its revisions first. This improves server scheduling, not AI model latency.
 
+Version ksnk.2 adds an OS lock across cooperating live servers in the current
+Windows login session. A competing server returns `APP_BUSY` before entering
+the tool body; a crashed owner can yield `APP_STATE_UNCERTAIN`. This lock is
+conservative across interactive Word instances because selection and Undo state
+can be shared. The previous ksnk.1/upstream servers do not participate. Restart
+old Codex/MCP sessions to obtain the protection; no user Word process is killed.
+
+`word_mcp_dispatch_status` reads this server's PID/version, queue depth, running
+request, wait/execution timings and last 100 outcomes without entering Word's
+STA queue. Diagnostics contain no filenames, arguments or document text.
+`WORD_MCP_QUEUE_WAIT_SECONDS` defaults to 30: an expired waiting job does not
+start. This is not a timeout for a running COM call. Client cancellation of a
+started edit does not cancel Word and must never trigger an automatic retry.
+
+Independent closed-file tools run in four worker threads, with at most 32 jobs
+pending/running. `WORD_MCP_OFFLINE_WORKERS` can change the pool size. Inputs and
+explicit/known derived outputs use canonical file locks; competing jobs return
+`FILE_BUSY`, while different files can run concurrently. File async bodies run
+inside their worker instead of blocking the MCP event loop. A private Word PDF
+converter continues to own its separate Word instance.
+
+Screen capture now uses the live STA/OS lock and preserves an overwritten output
+with the same backup/write helper. Comment reads omit reply descendants from
+the top-level list and retain native indexes, scope positions and resolved state.
+
+## Optional path policy
+
+Set `WORD_MCP_ALLOWED_ROOTS` to absolute directories separated by `;` on Windows.
+When set, tool path inputs, multi-source inputs, resolved live document selectors,
+and native/atomic output helpers check canonical containment before use. Traversal,
+sibling-name tricks, junction escapes and alternate streams are refused. The
+default remains unset so existing document locations keep working. This is not
+an OS sandbox and does not constrain resources that Word itself loads from links,
+or prevent a hostile filesystem actor changing a junction between check and use.
+
+This incremental release completes the coordination/diagnostics portion of P0;
+it does not claim to close every upstream issue or implement KitchenSink4Word.
+Its design was referenced, no AGPL source was copied into this MIT fork.
+
 ## Tests
 
 ```powershell
-python -m pytest tests/test_ksnk_regressions.py tests/test_sta_dispatch.py -q
+python -m pytest tests/test_ksnk_regressions.py tests/test_sta_dispatch.py tests/test_ksnk_coordination.py -q
 $env:WORD_MCP_NATIVE = '1'
 python -m pytest tests/test_word_native_ksnk.py -q -p no:faulthandler
 ```

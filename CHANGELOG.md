@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.21+ksnk.2] - 2026-10-13
+
+### Fixed
+- Coordinate interactive Word operations across participating server processes with a Windows named mutex. Refuse concurrent or abandoned ownership before entering the tool; never retry edits automatically.
+- Expire queued live calls before starting, pump COM messages while idle and reject new work if the STA exits. Route screen capture through the live STA and preserve overwritten capture/copy outputs.
+- Separate independent closed-file jobs into a bounded four-worker pool with canonical resource locks; report FILE_BUSY rather than racing same-file jobs.
+- List top-level comments once even when Word includes reply descendants in its document collection after reopening. Return native indexes, anchor positions and resolved state.
+- Add optional canonical allowed-root checks for tool inputs, live selectors and output helpers. Unset policy preserves existing document locations.
+
+### Diagnostics and validation
+- Add word_mcp_dispatch_status with PID/version, current jobs, queue depth, timings and bounded recent history. No filenames, text or tool arguments are recorded.
+- Add real cross-process lock/abandonment, cancellation, queue expiry, recovery, independent-file concurrency and junction-containment tests. Extend native tests with comment anchor/reply reopen, formatting-run replacement and interrupted-edit recovery.
+- Add a reproducible synthetic 10/50/100-page extraction benchmark. This release is an incremental P0 upgrade, not a claim to close every upstream issue.
+
 ## [1.6.21+ksnk.1] - 2026-10-13
 
 ### Fixed
